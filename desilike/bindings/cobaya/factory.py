@@ -177,6 +177,7 @@ class Primordial(Section):
         """
         return PowerSpectrumInterpolator1D.from_callable(pk_callable=lambda k: self.pk_k(k, mode=mode))
 
+
 class Fourier(Section):
 
     def pk_interpolator(self, non_linear=False, of='delta_m', **kwargs):
@@ -266,12 +267,13 @@ def cosmoprimo_to_classy_params(params):
     return toret
 
 
-def camb_or_classy_to_cosmoprimo(fiducial, provider, params, ignore_unknown_params=True):
+def camb_or_classy_to_cosmoprimo(fiducial, provider, params, ignore_unknown_params=True, return_input_params=False):
     if fiducial: cosmo = Cosmology.from_state(fiducial)
     else: cosmo = Cosmology()
     convert = dict(_convert_camb_or_classy_to_cosmoprimo_params)
     params = {**provider.params, **params}
     state = {convert[param]: value for param, value in params.items() if param in convert}
+    input_params = state.copy()
     A_s = None
     for p in provider.requirement_providers.values():
         if p.__class__.__name__ in ['classy', 'camb']:
@@ -298,6 +300,8 @@ def camb_or_classy_to_cosmoprimo(fiducial, provider, params, ignore_unknown_para
     cosmo = cosmo.clone(**state, engine=CobayaEngine)
     cosmo._engine.provider = provider
     cosmo._engine._derived['A_s'] = A_s
+    if return_input_params:
+        return cosmo, input_params
     return cosmo
 
 
@@ -380,12 +384,15 @@ def CobayaLikelihoodFactory(cls, name_like=None, kw_like=None, module=None, kw_c
         """Prepare any computation, importing any necessary code, files, etc."""
 
         _kw_cobaya = {name: getattr(self, name, value) for name, value in kw_cobaya.items()}
-        self.like = cls(**{**kw_like, **_kw_cobaya})
+        self.cache_size = 2
+        self.likes = [cls(**{**kw_like, **_kw_cobaya}) for i in range(self.cache_size)]
         self.ignore_unknown_cosmoprimo_params = getattr(self, 'ignore_unknown_cosmoprimo_params', True)
+        self._input_params = [{} for i in range(self.cache_size)]
         from desilike import mpi
-        self.like.mpicomm = mpi.COMM_SELF  # no likelihood-level MPI-parallelization
-        self._cosmo_params, self._nuisance_params = get_likelihood_params(self.like)
-        for param in self.like.varied_params: param.update(prior=None)  # remove prior on varied parameters (already taken care of by cobaya)
+        for like in self.likes:
+            like.mpicomm = mpi.COMM_SELF  # no likelihood-level MPI-parallelization
+            self._cosmo_params, self._nuisance_params = get_likelihood_params(like)
+            for param in like.varied_params: param.update(prior=None)  # remove prior on varied parameters (already taken care of by cobaya)
         """
         import inspect
         kwargs = {name: getattr(self, name) for name in inspect.getargspec(cls).args}
@@ -394,7 +401,8 @@ def CobayaLikelihoodFactory(cls, name_like=None, kw_like=None, module=None, kw_c
 
     def get_requirements(self):
         """Return dictionary specifying quantities calculated by a theory code are needed."""
-        requires = self.like.runtime_info.pipeline.get_cosmo_requires()
+        for like in self.likes:
+            requires = like.runtime_info.pipeline.get_cosmo_requires()
         self._fiducial = requires.get('fiducial', {})
         self._requires = CobayaEngine.get_requires(requires)
         return self._requires
@@ -405,9 +413,26 @@ def CobayaLikelihoodFactory(cls, name_like=None, kw_like=None, module=None, kw_c
         and return a log-likelihood.
         """
         if self._requires:
-            cosmo = camb_or_classy_to_cosmoprimo(self._fiducial, self.provider, params_values, ignore_unknown_params=self.ignore_unknown_cosmoprimo_params)
-            self.like.runtime_info.pipeline.set_cosmo_requires(cosmo)
-        loglikelihood, derived = self.like({name: value for name, value in params_values.items() if name in self._nuisance_params}, return_derived=True)
+            from desilike.utils import deep_eq
+            cosmo, input_params = camb_or_classy_to_cosmoprimo(self._fiducial, self.provider, params_values, ignore_unknown_params=self.ignore_unknown_cosmoprimo_params, return_input_params=True)
+            # manual caching
+            found = False
+            for ilike, ip in enumerate(self._input_params):
+                if deep_eq(input_params, ip):
+                    found = True
+                    break
+            if not found:
+                ilike = (getattr(self, '_ilike', -1) + 1) % self.cache_size  # set at a new position
+                self.likes[ilike].runtime_info.pipeline.set_cosmo_requires(cosmo)
+                self._input_params[ilike] = input_params
+            #    print('COMPUTE COSMO!') #, input_params, _input_params)
+            #else:
+                #print('SKIP COSMO!')
+        #import time
+        #t0 = time.time()
+        loglikelihood, derived = self.likes[ilike]({name: value for name, value in params_values.items() if name in self._nuisance_params}, return_derived=True)
+        #print(time.time() - t0)
+        self._ilike = ilike
         if _derived is not None:
             for value in derived:
                 if value.param.ndim == 0:

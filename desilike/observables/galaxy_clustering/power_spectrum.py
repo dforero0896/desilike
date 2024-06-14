@@ -90,7 +90,7 @@ class TracerPowerSpectrumMultipolesObservable(BaseCalculator):
         else:
             self.wmatrix.runtime_info.initialize()
         input_kedges = self.kedges is not None
-        for name in ['k', 'ells', 'kedges', 'shotnoise']:
+        for name in ['k', 'ells', 'kedges']:
             setattr(self, name, getattr(self.wmatrix, name))
         kmasklim = self.wmatrix.kmasklim
         if kmasklim is not None:  # cut has been applied to input k
@@ -101,6 +101,7 @@ class TracerPowerSpectrumMultipolesObservable(BaseCalculator):
         if isinstance(self.covariance, ObservableCovariance):
             if input_kedges: x, method = [(edges[:-1] + edges[1:]) / 2. for edges in self.kedges], 'mid'
             else: x, method = list(self.k),'mean'
+            self.nobs = self.covariance.nobs
             self.covariance = self.covariance.xmatch(x=x, projs=list(self.ells), method=method).view(projs=list(self.ells))
         self.transform = transform
         allowed_transform = [None, 'cubic']
