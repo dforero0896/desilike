@@ -257,7 +257,7 @@ params:
 
 ---
 
-class: DampedBAOWigglesTracerCrossPowerSpectrumMultipoles
+class: DampedBAOWigglesCrossTracerPowerSpectrumMultipoles
 
 params:
   b1a:
@@ -302,7 +302,7 @@ params:
   
 ---
 
-class: DampedBAOWigglesTracerDTVoidPowerSpectrumMultipoles
+class: DampedBAOWigglesDTVoidTracerPowerSpectrumMultipoles
 
 params:
   b1a:
@@ -351,9 +351,9 @@ params:
     latex: c_{ex}
     fixed: False
 
+---
 
-
-class: DampedBAOWigglesTracerCrossCorrelationFunctionMultipoles
+class: DampedBAOWigglesCrossTracerCorrelationFunctionMultipoles
 
 params:
   b1a:
@@ -398,7 +398,7 @@ params:
   
 ---
 
-class: DampedBAOWigglesTracerDTVoidCorrelationFunctionMultipoles
+class: DampedBAOWigglesDTVoidTracerCorrelationFunctionMultipoles
 
 params:
   b1a:

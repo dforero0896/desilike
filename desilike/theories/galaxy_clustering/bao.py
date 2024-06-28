@@ -738,7 +738,7 @@ class DampedBAOWigglesTracerPowerSpectrumMultipoles(BaseBAOWigglesTracerPowerSpe
     """
     
     
-class DampedBAOWigglesTracerDTVoidPowerSpectrumMultipoles(BaseBAOWigglesTracerPowerSpectrumMultipoles):
+class DampedBAOWigglesDTVoidTracerPowerSpectrumMultipoles(BaseBAOWigglesTracerPowerSpectrumMultipoles):
     r"""
     Theory BAO power spectrum multipoles, with broadband terms, used in the BOSS DR12 BAO analysis by Beutler et al. 2017.
     Supports pre-, reciso, recsym, real (f = 0) and redshift-space reconstruction.
@@ -786,7 +786,7 @@ class DampedBAOWigglesTracerDTVoidPowerSpectrumMultipoles(BaseBAOWigglesTracerPo
     https://arxiv.org/abs/1607.03149
     """
 
-class DampedBAOWigglesTracerCrossPowerSpectrumMultipoles(BaseBAOWigglesTracerPowerSpectrumMultipoles):
+class DampedBAOWigglesCrossTracerPowerSpectrumMultipoles(BaseBAOWigglesTracerPowerSpectrumMultipoles):
     r"""
     Theory BAO power spectrum multipoles, with broadband terms, used in the BOSS DR12 BAO analysis by Beutler et al. 2017.
     Supports pre-, reciso, recsym, real (f = 0) and redshift-space reconstruction.
@@ -1213,7 +1213,7 @@ class DampedBAOWigglesTracerCorrelationFunctionMultipoles(BaseBAOWigglesTracerCo
     """
 
 
-class DampedBAOWigglesTracerCrossCorrelationFunctionMultipoles(BaseBAOWigglesTracerCorrelationFunctionMultipoles):
+class DampedBAOWigglesCrossTracerCorrelationFunctionMultipoles(BaseBAOWigglesTracerCorrelationFunctionMultipoles):
     r"""
     Theory BAO correlation function multipoles, with broadband terms.
     Supports pre-, reciso, recsym, real (f = 0) and redshift-space reconstruction.
@@ -1262,7 +1262,7 @@ class DampedBAOWigglesTracerCrossCorrelationFunctionMultipoles(BaseBAOWigglesTra
 
 
 
-class DampedBAOWigglesTracerDTVoidCorrelationFunctionMultipoles(BaseBAOWigglesTracerCorrelationFunctionMultipoles):
+class DampedBAOWigglesDTVoidTracerCorrelationFunctionMultipoles(BaseBAOWigglesTracerCorrelationFunctionMultipoles):
     r"""
     Theory BAO correlation function multipoles, with broadband terms.
     Supports pre-, reciso, recsym, real (f = 0) and redshift-space reconstruction.
