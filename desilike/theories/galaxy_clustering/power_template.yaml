@@ -345,6 +345,14 @@ params:
   n:
     derived: True
     latex: n
+  dA:
+    value: 1.
+    prior:
+      limits: [0., 2.]
+    ref:
+      limits: [0.95, 1.05]
+    delta: 0.02
+    latex: dA
 
 ---
 
