@@ -245,6 +245,7 @@ class ShapeFitCompressionObservable(BaseCompressionObservable):
     https://arxiv.org/abs/2106.07641
     """
     meta_names = ['kp']
+    conflict_names = ['dA', 'dsigmar']
 
     def initialize(self, *args, **kwargs):
         super(ShapeFitCompressionObservable, self).initialize(*args, extractor=ShapeFitPowerSpectrumExtractor(), **kwargs)

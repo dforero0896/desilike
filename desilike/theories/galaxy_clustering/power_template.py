@@ -322,6 +322,7 @@ class BAOExtractor(BasePowerSpectrumExtractor):
         state['DH_over_rd'] = state['DH'] / state['rd']
         state['DM_over_rd'] = state['DM'] / state['rd']
         state['DH_over_DM'] = state['DH'] / state['DM']
+        state['DM_over_DH'] = state['DM'] / state['DH']
         state['DV_over_rd'] = state['DV'] / state['rd']
         for name, value in state.items(): setattr(self, name + ('_fid' if fiducial else ''), value)
 
@@ -642,7 +643,7 @@ class ShapeFitPowerSpectrumExtractor(BasePowerSpectrumExtractor):
         self.kp, self.a = float(kp), float(a)
         self.n_varied = bool(n_varied)
         self.dfextractor = dfextractor
-        allowed_dfextractor = ['Ap', 'fsigmar']
+        allowed_dfextractor = ['Ap', 'fsigmar', 'f']
         if self.dfextractor not in allowed_dfextractor:
             raise ValueError('dfextractor must be one of {}, found {}'.format(allowed_dfextractor, self.dfextractor))
         self.r = float(r)
@@ -680,7 +681,9 @@ class ShapeFitPowerSpectrumExtractor(BasePowerSpectrumExtractor):
         state['f_sqrt_Ap'] = f * state['Ap']**0.5
         # Eq. 3.11 of https://arxiv.org/pdf/2212.04522.pdf
         dm = state['m'] - getattr(self, 'm_fid', state['m'])
-        state['f_sigmar'] = f * pknow_dd_interpolator.sigma_r(self.r * s) * np.exp(dm / (2 * self.a) * np.tanh(self.a * self.fiducial.rs_drag / self.r))
+        state['sigmar'] = pknow_dd_interpolator.sigma_r(self.r * s) * np.exp(dm / (2 * self.a) * np.tanh(self.a * np.log(self.fiducial.rs_drag / self.r)))
+        #print("factor"+suffix, np.exp(dm / (2 * self.a) * np.tanh(self.a * np.log(self.fiducial.rs_drag / self.r))), flush = True)
+        state['f_sigmar'] = f * state['sigmar']
         for name, value in state.items(): setattr(self, name + suffix, value)
 
     def get(self):
@@ -688,11 +691,16 @@ class ShapeFitPowerSpectrumExtractor(BasePowerSpectrumExtractor):
         self.dn = self.n - self.n_fid
         self.dm = self.m - self.m_fid
         self.dA = self.Ap / self.Ap_fid #Will be 1 when fixed
+        self.dsigmar = self.sigmar / self.sigmar_fid #Will be 1 when fixed
         if self.dfextractor == 'Ap':
-            self.df = self.f_sqrt_Ap / self.f_sqrt_Ap_fid / self.dA**0.5
+            self.df = self.f_sqrt_Ap / self.f_sqrt_Ap_fid #/ self.dA**0.5
+        elif self.dfextractor == 'fsigmar':
+            self.df = self.f_sigmar / self.f_sigmar_fid #/ self.dsigmar
+        elif self.dfextractor == 'f':
+            self.df = self.f / self.f_fid #/ self.dsigmar
         else:
-            self.df = self.f_sigmar / self.f_sigmar_fid / self.dA**0.5
-
+            raise ValueError(f"dfextractor {self.dfextractor} not allowed.")
+        #print(f"="*20, f"Extractor_params: dm = {self.dm}, dsigmar = {self.dsigmar}, df(from s8) = {self.f_sigmar / self.f_sigmar_fid}, dA = {self.dA}, df(from Ap) = {self.f_sqrt_Ap / self.f_sqrt_Ap_fid}, df(from f) = {self.f / self.f_fid}, f = {self.f}, f_sigmar = {self.f_sigmar}", "="*20, flush = True)
         return self
 
 
