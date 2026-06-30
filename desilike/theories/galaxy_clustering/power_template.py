@@ -746,7 +746,7 @@ class ShapeFitPowerSpectrumTemplate(BasePowerSpectrumTemplate):
         super(ShapeFitPowerSpectrumTemplate, self).initialize(*args, with_now=with_now, **kwargs)
         ShapeFitPowerSpectrumExtractor._set_base(self, fiducial=True)
 
-    def calculate(self, df=1., dm=0., dn=0.):
+    def calculate(self, df=1., dm=0., dn=0., dA=1.):
         super(ShapeFitPowerSpectrumTemplate, self).calculate()
         factor = _bcast_shape(jnp.exp(dm / self.a * jnp.tanh(self.a * jnp.log(self.k / self.kp)) + dn * jnp.log(self.k / self.kp)), self.pk_dd_fid.shape, axis=0)
         #factor = np.exp(dm * np.log(self.k / self.kp))
@@ -761,6 +761,7 @@ class ShapeFitPowerSpectrumTemplate(BasePowerSpectrumTemplate):
         self.f0 = self.f0_fid * df
         self.fk = self.fk_fid * df
         self.f_sqrt_Ap = self.f * self.Ap_fid**0.5
+        self.Ap = dA * self.Ap_fid
 
     def get(self):
         return self
@@ -782,7 +783,7 @@ class BandVelocityPowerSpectrumExtractor(BasePowerSpectrumExtractor):
         Specifications for fiducial cosmology, used to compute the linear power spectrum. Either:
 
         - str: name of fiducial cosmology in :class:`cosmoprimo.fiucial`
-        - tuple: (name of fiducial cosmology, dictionary of parameters to update)
+        - tuple: (name of fiducial cosmology, dictiogit nary of parameters to update)
         - dict: dictionary of parameters
         - :class:`cosmoprimo.Cosmology`: Cosmology instance
 
