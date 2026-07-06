@@ -111,6 +111,63 @@ def _ap_auto_params(apmode):
         return [Parameter('qap', value=1., prior=_ap_prior, ref=_ap_ref, fd_eps=_ap_fd, latex=r'q_\mathrm{ap}')]
     raise ValueError(f"apmode must be one of 'qparqper', 'qisoqap', 'qiso', 'qap'; got {apmode!r}")
 
+def _integrate_sigma_r2_jax(r, pk, k_fine):
+    """JAX-traceable version for runtime evaluation."""
+    logk = jnp.log(k_fine)
+    x = k_fine * r
+    small = x < 1e-2
+    w2_small = 1.0 - x**2 / 5.0
+    w2_large = 9.0 * (jnp.sin(x) - x * jnp.cos(x))**2 / x**6
+    w2 = jnp.where(small, w2_small, w2_large)
+    integrand = pk * w2 * k_fine**3
+    dlogk = logk[1:] - logk[:-1]
+    integral = jnp.sum(0.5 * (integrand[1:] + integrand[:-1]) * dlogk)
+    return 1. / (2. * jnp.pi**2) * integral
+
+def _compute_shapefit_fiducials(fiducial_cosmo, z, kp, a, with_now, r=8., n_varied=False):
+    """Compute ShapeFit fiducial quantities at compile time using native cosmoprimo APIs."""
+    from cosmoprimo import PowerSpectrumBAOFilter
+    fo = fiducial_cosmo.get_fourier()
+    
+    # 1. Directly use cosmoprimo for sigma8 and fsigma8 (exactly like the template)
+    sigma8_fid = float(fo.sigma8_z(z, of='delta_cb'))
+    fsigma8_fid = float(fo.sigma8_z(z, of='theta_cb')) # This is effectively f * sigma8
+    f_fid = fsigma8_fid / sigma8_fid
+    n_fid = float(fiducial_cosmo.n_s)
+    
+    # 2. Get power spectrum interpolators
+    pk_interp = fo.pk_interpolator(of='delta_cb', **_kw_pk).to_1d(z=z)
+    if with_now:
+        bao_filter = PowerSpectrumBAOFilter(pk_interp, engine=with_now, cosmo=fiducial_cosmo, cosmo_fid=fiducial_cosmo)
+        pknow_interp = bao_filter.smooth_pk_interpolator()
+    else:
+        pknow_interp = pk_interp
+        
+    # 3. Compute slope 'm' at pivot kp using finite differences
+    dk = 1e-2
+    k_query = kp * np.array([1. - dk, 1., 1. + dk])
+    pknow_minus = float(pknow_interp(k_query[0]))
+    pknow_kp = float(pknow_interp(k_query[1]))
+    pknow_plus = float(pknow_interp(k_query[2]))
+    
+    slope_pknow = (np.log(pknow_plus) - np.log(pknow_minus)) / (np.log(k_query[2]) - np.log(k_query[0]))
+    slope_pk_prim = (n_fid + 1.0) if n_varied else 0.0
+    m_fid = slope_pknow - slope_pk_prim
+    
+    # 4. Amplitude Ap
+    Ap_fid = pknow_kp
+    f_sqrt_Ap_fid = f_fid * Ap_fid**0.5
+    
+    # 5. Directly use cosmoprimo for sigmar and fsigmar at the fixed fiducial radius r
+    # (If r=8, this is mathematically identical to sigma8_fid)
+    sigmar_fid = float(fo.sigma_rz(r, z, of='delta_cb'))
+    fsigmar_fid = float(fo.sigma_rz(r, z, of='theta_cb'))
+    
+    return {
+        'm_fid': m_fid, 'Ap_fid': Ap_fid, 'f_sqrt_Ap_fid': f_sqrt_Ap_fid,
+        'f_sigmar_fid': fsigmar_fid, 'n_fid': n_fid, 'f_fid': f_fid, 
+        'sigma8_fid': sigma8_fid, 'fsigma8_fid': fsigma8_fid
+    }
 
 # ── BAO template ──────────────────────────────────────────────────────────────
 
@@ -491,10 +548,13 @@ class ShapeFitSpectrum2Template(Spectrum2Template):
                           ref=dict(dist='norm', loc=0., scale=0.05), fd_eps=0.01, latex=r'\delta m'),
                 Parameter('dn', value=0., fixed=True, prior=dict(limits=[-0.5, 0.5]),
                           ref=dict(dist='norm', loc=0., scale=0.05), fd_eps=0.01, latex=r'\delta n'),
+                Parameter('dAp', value=1., prior=dict(limits=[0., 2.]),
+                          ref=dict(dist='norm', loc=1., scale=0.05), fd_eps=0.02, latex=r'\delta A_{p}'),
             ], tracers=None)
 
     def __init__(self, k=None, z=1., fiducial='DESI', with_now='peakaverage',
-                 only_now=False, apmode='qparqper', eta=1. / 3., kp=0.03, a=0.6, params=None):
+                 only_now=False, apmode='qparqper', eta=1. / 3., kp=0.03, a=0.6, params=None,
+                 engine = 'class', cosmo = None):
         vc = type(self).propose_params(apmode=str(apmode))
         if params is not None:
             vc = vc + VariableCollection(params)
@@ -502,6 +562,10 @@ class ShapeFitSpectrum2Template(Spectrum2Template):
         # See BAOSpectrum2Template.__init__: _qpar_qper() reads from self.params rather
         # than self.qpar/self.qper, since __call__ reassigns those to the derived output.
         self.params = vc
+
+        if cosmo is None:
+            cosmo = CosmoprimoCosmology(engine=engine, fiducial=fiducial)
+        self.cosmo = cosmo
 
     def __post_init__(self, k=None, z=1., fiducial='DESI', with_now='peakaverage',
                       only_now=False, apmode='qparqper', eta=1. / 3., kp=0.03, a=0.6, params=None):
@@ -519,7 +583,7 @@ class ShapeFitSpectrum2Template(Spectrum2Template):
         self.z = float(z)
 
         self._fiducial = _get_fiducial(fiducial)
-
+        self._rs_drag_fid = self._fiducial.rs_drag
         fo = self._fiducial.get_fourier()
         sigma8 = fo.sigma8_z(z, of='delta_cb')
         fsigma8 = fo.sigma8_z(z, of='theta_cb')
@@ -542,6 +606,13 @@ class ShapeFitSpectrum2Template(Spectrum2Template):
             self._pknow_dd_fid = self._pk_dd_fid
         self.sigma8_fid = jnp.asarray(self._sigma8_fid)
 
+        fiducials = _compute_shapefit_fiducials(
+            self._fiducial, self.z, self._kp, self._a, with_now, n_varied=False
+        )
+        self._Ap_fid = float(fiducials['Ap_fid'])
+        self._m_fid = float(fiducials['m_fid'])
+        self._n_fid = float(fiducials['n_fid'])
+
     def _qpar_qper(self):
         if self._apmode == 'qparqper':
             return self.params['qpar'].value, self.params['qper'].value
@@ -563,10 +634,11 @@ class ShapeFitSpectrum2Template(Spectrum2Template):
         dm = self.dm.value
         dn = self.dn.value
         df = self.df.value
+        dAp = self.dAp.value
         factor = jnp.exp(dm / self._a * jnp.tanh(self._a * jnp.log(self.k / self._kp))
                          + dn * jnp.log(self.k / self._kp))
-        self.pk_dd = self._pk_dd_fid * factor
-        self.pknow_dd = self._pknow_dd_fid * factor
+        self.pk_dd = dAp * self._pk_dd_fid * factor
+        self.pknow_dd = dAp * self._pknow_dd_fid * factor
         if self._only_now:
             self.pk_dd = self.pknow_dd
         self.f = self._f_fid * df
@@ -575,20 +647,41 @@ class ShapeFitSpectrum2Template(Spectrum2Template):
         qpar, qper = self._qpar_qper()
         self.qpar = qpar
         self.qper = qper
-        self.sigma8 = jnp.asarray(self._sigma8_fid)
-        self.fsigma8 = self._fsigma8_fid * df
+        # Update sigma8 & fsigma8 using Eq. A.12 ---
+        # (sigma_s8 / sigma_s8_fid)^2 = dAp * exp((dm + dn)/a * tanh(a * ln(r_d_fid / 8)))
+        tanh_arg = self._a * jnp.log(self._rs_drag_fid / 8.)
+        dsigma8 = dAp * jnp.exp((dm + dn) / self._a * jnp.tanh(tanh_arg))
+        
+        self.sigma8 = self._sigma8_fid * jnp.sqrt(dsigma8)
+        self.fsigma8 = self.f * self.sigma8
+        # ---------------------------------------------------------
+        
         self.sigma8_fid = jnp.asarray(self._sigma8_fid)
+
+
+         # --- NEW: Compute and expose physical ShapeFit parameters ---
+        self.Ap = dAp * self._Ap_fid
+        self.m = self._m_fid + dm
+        self.n = self._n_fid + dn
+        self.f_sqrt_Ap = self.f * self.Ap**0.5
+        # ----------------------------------------------------------
+
         return self.pk_dd
 
     def tree_flatten(self):
+        # Add the new ShapeFit parameters to the JAX tree leaves
         return ([self.pk_dd, self.pknow_dd, self.f, self.f0, self.fk, self.qpar, self.qper,
-                 self.sigma8, self.fsigma8, self.sigma8_fid], {'k': self.k})
+                 self.sigma8, self.fsigma8, self.sigma8_fid,
+                 self.Ap, self.m, self.n, self.f_sqrt_Ap], 
+                {'k': self.k})
 
     @classmethod
     def tree_unflatten(cls, aux, children):
         obj = object.__new__(cls)
+        # Unflatten the new leaves
         (obj.pk_dd, obj.pknow_dd, obj.f, obj.f0, obj.fk, obj.qpar, obj.qper,
-         obj.sigma8, obj.fsigma8, obj.sigma8_fid) = children
+         obj.sigma8, obj.fsigma8, obj.sigma8_fid,
+         obj.Ap, obj.m, obj.n, obj.f_sqrt_Ap) = children
         obj.k = aux['k']
         return obj
 
@@ -1334,3 +1427,228 @@ class TurnOverExtractor(Calculator):
         obj.DH_over_DM, obj.DV_times_kTO, obj.kTO, obj.pkTO_dd, obj.qap, obj.qto = children
         obj.z = aux['z']
         return obj
+
+
+
+class ShapeFitExtractor(BAOExtractor):
+    r"""
+    Extract ShapeFit parameters from linear power spectrum.
+
+    Inherits from :class:`BAOExtractor` to simultaneously compute standard BAO distance 
+    parameters. At each call, retrieves the ShapeFit parameters :math:`n`, :math:`m`, 
+    :math:`A_p`, :math:`f\sqrt{A_p}`, and :math:`f\sigma_r`, plus their ratios relative 
+    to a fixed fiducial cosmology.
+
+    Parameters
+    ----------
+    z : float, default=1.
+        Effective redshift.
+
+    kp : float, default=0.03
+        Pivot point in ShapeFit parameterization [h/Mpc].
+
+    a : float, default=0.6
+        Steepness parameter in ShapeFit parameterization.
+
+    eta : float, default=1./3.
+        Exponent defining the :math:`D_V` combination: 
+        :math:`q_{\rm iso} = q_\parallel^\eta \, q_\perp^{1-\eta}`.
+
+    n_varied : bool, default=False
+        Use second order ShapeFit parameter ``n``.
+        This choice changes the definition of parameter ``m`` by including the 
+        primordial power spectrum slope.
+
+    dfextractor : str, default='Ap'
+        Method to compute the growth rate scaling parameter ``df``. 
+        Either 'Ap' (using :math:`f\sqrt{A_p}`) or 'fsigmar' (using :math:`f\sigma_r`).
+
+    r : float, default=8.
+        Sphere radius [Mpc/h] to estimate the normalization of the linear power 
+        spectrum for the :math:`f\sigma_r` computation.
+
+    with_now : str or False, default='peakaverage'
+        Engine for the BAO-filtered smooth power spectrum ('peakaverage', 'wallish2018').
+        Set to False to skip (uses the full power spectrum instead).
+
+    fiducial : str or cosmoprimo.Cosmology, default='DESI'
+        Fiducial cosmology used to normalise the AP ratios and compute fiducial 
+        ShapeFit parameters.
+
+    cosmo : PrimordialCosmology, optional
+        Cosmology provider; a :class:`CosmoprimoCosmology` is created if not given.
+
+    Attributes
+    ----------
+    DH_over_rd, DM_over_rd, DH_over_DM, DV_over_rd : JAX scalar
+        Measured BAO distance combinations (inherited from BAOExtractor).
+    qpar, qper, qiso, qap : JAX scalar
+        AP ratios relative to fiducial (inherited from BAOExtractor).
+    n, m, Ap, f_sqrt_Ap, f_sigmar : JAX scalar
+        Measured absolute ShapeFit parameters.
+    dn, dm, dA, df : JAX scalar
+        ShapeFit parameters relative to fiducial.
+
+    Reference
+    ---------
+    https://arxiv.org/abs/2106.07641
+    https://arxiv.org/pdf/2212.04522.pdf
+    """
+
+    def __init__(self, z=1., kp=0.03, a=0.6, eta=1./3., n_varied=False, 
+                 dfextractor='Ap', r=8., with_now='peakaverage', fiducial='DESI', cosmo=None):
+        super().__init__(z=z, eta=eta, fiducial=fiducial, cosmo=cosmo)
+        self.kp = float(kp)
+        self.a = float(a)
+        self.n_varied = bool(n_varied)
+        if dfextractor not in ['Ap', 'fsigmar']:
+            raise ValueError(f"dfextractor must be one of ['Ap', 'fsigmar'], found {dfextractor}")
+        self.dfextractor = dfextractor
+        self.r = float(r)
+        self.with_now = with_now
+
+    def __post_init__(self, z=1., kp=0.03, a=0.6, eta=1./3., n_varied=False, 
+                      dfextractor='Ap', r=8., with_now='peakaverage', fiducial='DESI', cosmo=None):
+        # Initialize BAOExtractor requirements and fiducial distances
+        super().__post_init__(z=z, eta=eta, fiducial=fiducial, cosmo=cosmo)
+        
+        self.kp = float(kp)
+        self.a = float(a)
+        self.n_varied = bool(n_varied)
+        self.dfextractor = dfextractor
+        self.r = float(r)
+        self.with_now = with_now
+        
+        # Fixed dense k-grid for interpolation and sigma_r integration
+        self._k_fine = jnp.geomspace(1e-4, 1e2, 2000)
+        self._dk = 1e-2
+        
+        # Add ShapeFit-specific requirements to the cosmology provider
+        reqs = {
+            'fourier.sigma8_z': [
+                {'of': 'delta_cb', 'z': self.z},
+                {'of': 'theta_cb', 'z': self.z},
+            ],
+        }
+        if self.with_now:
+            reqs['fourier.pk_now'] = [{'of': 'delta_cb', 'engine': str(self.with_now), 'z': self.z, 'k': self._k_fine}]
+        else:
+            reqs['fourier.pk'] = [{'of': 'delta_cb', 'z': self.z, 'k': self._k_fine}]
+            
+        self.cosmo.add_requirements(reqs)
+        
+        # Compute and cache all fiducial quantities at compile time using the shared helper
+        fiducials = _compute_shapefit_fiducials(
+            self._fiducial, self.z, self.kp, self.a, self.with_now, 
+            r=self.r, n_varied=self.n_varied
+        )
+        self.n_fid = fiducials['n_fid']
+        self.m_fid = fiducials['m_fid']
+        self.Ap_fid = fiducials['Ap_fid']
+        self.f_sqrt_Ap_fid = fiducials['f_sqrt_Ap_fid']
+        self.f_sigmar_fid = fiducials['f_sigmar_fid']
+
+    def __call__(self):
+        # 1. Compute standard BAO parameters (DH/rd, qpar, qper, etc.)
+        super().__call__() 
+        
+        # 2. Get cosmological quantities from the JAX wrapper
+        sigma8 = self.cosmo.get_fourier().sigma8_z(of='delta_cb', z=self.z)
+        fsigma8 = self.cosmo.get_fourier().sigma8_z(of='theta_cb', z=self.z)
+        self.sigma8 = sigma8
+        self.fsigma8 = fsigma8
+        self.f = fsigma8 / sigma8
+        self.n = self.cosmo.get('n_s')
+        
+        s = self.cosmo.rs_drag / self._fiducial.rs_drag
+        kp = self.kp / s
+        
+        # 3. Get no-wiggle power spectrum on the fine grid
+        if self.with_now:
+            pknow_dd_fine = self.cosmo.get_fourier().pk_now(of='delta_cb', engine=self.with_now, z=self.z, k=self._k_fine)
+        else:
+            pknow_dd_fine = self.cosmo.get_fourier().pk(of='delta_cb', z=self.z, k=self._k_fine)
+            
+        # 4. Interpolate at the shifted pivot points kp * (1 +/- dk)
+        k_query = kp * jnp.array([1. - self._dk, 1., 1. + self._dk])
+        log_k_fine = jnp.log(self._k_fine)
+        log_pknow_fine = jnp.log(pknow_dd_fine)
+        log_k_query = jnp.log(k_query)
+        
+        log_pknow_query = jnp.interp(log_k_query, log_k_fine, log_pknow_fine)
+        pknow_query = jnp.exp(log_pknow_query)
+        
+        pknow_kp_minus = pknow_query[0]
+        pknow_kp = pknow_query[1]
+        pknow_kp_plus = pknow_query[2]
+        
+        slope_pknow = (jnp.log(pknow_kp_plus) - jnp.log(pknow_kp_minus)) / (jnp.log(k_query[2]) - jnp.log(k_query[0]))
+        
+        if self.n_varied:
+            slope_pk_prim = self.n + 1.0
+        else:
+            slope_pk_prim = 0.0
+            
+        self.m = slope_pknow - slope_pk_prim
+        self.Ap = 1. / s**3 * pknow_kp
+        self.f_sqrt_Ap = self.f * self.Ap**0.5
+        
+        # 5. Compute f_sigmar using JAX-traceable integration
+        dm = self.m - self.m_fid
+        r_phys = self.r * s
+        sigmar = _integrate_sigma_r2_jax(r_phys, pknow_dd_fine, self._k_fine)**0.5
+        self.f_sigmar = self.f * sigmar * jnp.exp(dm / (2 * self.a) * jnp.tanh(self.a * self._fiducial.rs_drag / self.r))
+        
+        # 6. Compute relative ShapeFit parameters
+        self.dn = self.n - self.n_fid
+        self.dm = dm
+        self.dA = self.Ap / self.Ap_fid
+        
+        if self.dfextractor == 'Ap':
+            self.df = self.f_sqrt_Ap / self.f_sqrt_Ap_fid / self.dA**0.5
+        else:
+            self.df = self.f_sigmar / self.f_sigmar_fid / self.dA**0.5
+            
+        return self
+
+    def tree_flatten(self):
+        # Get BAO leaves and aux data
+        leaves, aux = super().tree_flatten()
+        
+        # Add ShapeFit static parameters to aux
+        aux.update({
+            'kp': self.kp, 'a': self.a, 'eta': self._eta,
+            'n_varied': self.n_varied, 'dfextractor': self.dfextractor,
+            'r': self.r, 'with_now': self.with_now, 'k_fine': self._k_fine
+        })
+        
+        # Append ShapeFit dynamic leaves
+        return leaves + [self.sigma8, self.fsigma8, self.f, self.n,
+                         self.m, self.Ap, self.f_sqrt_Ap, self.f_sigmar,
+                         self.dn, self.dm, self.dA, self.df], aux
+
+    @classmethod
+    def tree_unflatten(cls, aux, children):
+        # Unflatten BAO attributes first (first 8 children)
+        obj = BAOExtractor.tree_unflatten(aux, children[:8])
+        
+        # Unflatten ShapeFit attributes (next 12 children)
+        (obj.sigma8, obj.fsigma8, obj.f, obj.n,
+         obj.m, obj.Ap, obj.f_sqrt_Ap, obj.f_sigmar,
+         obj.dn, obj.dm, obj.dA, obj.df) = children[8:]
+         
+        # Restore static parameters
+        obj.kp = aux['kp']
+        obj.a = aux['a']
+        obj._eta = aux['eta']
+        obj.n_varied = aux['n_varied']
+        obj.dfextractor = aux['dfextractor']
+        obj.r = aux['r']
+        obj.with_now = aux['with_now']
+        obj._k_fine = aux['k_fine']
+        return obj
+
+
+
+
+
