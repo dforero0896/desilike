@@ -26,7 +26,7 @@ import jax.numpy as jnp
 import lsstypes as types
 
 from ...base import Calculator
-from ...theories.galaxy_clustering.template import BAOExtractor, BAOPhaseShiftExtractor, TurnOverExtractor
+from ...theories.galaxy_clustering.template import BAOExtractor, BAOPhaseShiftExtractor, TurnOverExtractor, ShapeFitExtractor
 
 
 def _format_compression_data(data, covariance, parameters):
@@ -225,4 +225,51 @@ class TurnOverCompressionObservable(BaseCompressionObservable):
 
     def __init__(self, data=None, covariance=None, parameters=None, name='turnover', **kwargs):
         super().__init__(extractor=TurnOverExtractor(**kwargs),
+                         data=data, covariance=covariance, parameters=parameters, name=name)
+
+
+class ShapeFitCompressionObservable(BaseCompressionObservable):
+    r"""Compare ShapeFit parameter measurements to theory predictions.
+
+    Wraps :class:`ShapeFitExtractor`.  Valid parameter names are
+    ``'DH_over_rd'``, ``'DM_over_rd'``, ``'DV_over_rd'``, ``'DH_over_DM'``,
+    ``'qpar'``, ``'qper'``, ``'qiso'``, ``'qap'``,
+    ``'sigma8'``, ``'fsigma8'``, ``'f'``, ``'n'``,
+    ``'m'``, ``'Ap'``, ``'f_sqrt_Ap'``, ``'f_sigmar'``,
+    ``'dn'``, ``'dm'``, ``'dA'``, ``'df'``.
+
+    Parameters
+    ----------
+    data : None, array-like, or lsstypes.ObservableLike, default=None
+        Measured ShapeFit values.
+    covariance : None, array-like, or lsstypes.CovarianceMatrix, default=None
+        Covariance matrix.
+    parameters : list of str, default=None
+        Parameter names to compare; required when *data* is not an lsstypes object.
+    name : str, default='shapefit'
+        Observable name.
+    z : float, default=1.
+        Effective redshift forwarded to :class:`ShapeFitExtractor`.
+    kp : float, default=0.03
+        Pivot scale [h/Mpc] forwarded to :class:`ShapeFitExtractor`.
+    a : float, default=0.6
+        Steepness parameter forwarded to :class:`ShapeFitExtractor`.
+    eta : float, default=1./3.
+        DV exponent forwarded to :class:`ShapeFitExtractor`.
+    n_varied : bool, default=False
+        Use second order ShapeFit parameter ``n``.
+    dfextractor : str, default='Ap'
+        Method to compute ``df`` (``'Ap'`` or ``'fsigmar'``).
+    r : float, default=8.
+        Scale for :math:`f\sigma_r` computation.
+    with_now : str, default='peakaverage'
+        Engine for BAO-filtered smooth power spectrum.
+    fiducial : str or cosmoprimo.Cosmology, default='DESI'
+        Fiducial cosmology forwarded to :class:`ShapeFitExtractor`.
+    cosmo : PrimordialCosmology, optional
+        Cosmology provider forwarded to :class:`ShapeFitExtractor`.
+    """
+
+    def __init__(self, data=None, covariance=None, parameters=None, name='shapefit', **kwargs):
+        super().__init__(extractor=ShapeFitExtractor(**kwargs),
                          data=data, covariance=covariance, parameters=parameters, name=name)

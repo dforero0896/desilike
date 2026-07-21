@@ -54,7 +54,7 @@ time ``__call__`` returns (and include them in ``tree_flatten``/``tree_unflatten
 
 import numpy as np
 import jax.numpy as jnp
-
+import jax
 from ...base import Calculator
 from ...parameter import Parameter, VariableCollection
 from ..primordial_cosmology import CosmoprimoCosmology, _get_fiducial
@@ -134,7 +134,6 @@ def _compute_shapefit_fiducials(fiducial_cosmo, z, kp, a, with_now, r=8., n_vari
     fsigma8_fid = float(fo.sigma8_z(z, of='theta_cb')) # This is effectively f * sigma8
     f_fid = fsigma8_fid / sigma8_fid
     n_fid = float(fiducial_cosmo.n_s)
-    
     # 2. Get power spectrum interpolators
     pk_interp = fo.pk_interpolator(of='delta_cb', **_kw_pk).to_1d(z=z)
     if with_now:
@@ -166,7 +165,8 @@ def _compute_shapefit_fiducials(fiducial_cosmo, z, kp, a, with_now, r=8., n_vari
     return {
         'm_fid': m_fid, 'Ap_fid': Ap_fid, 'f_sqrt_Ap_fid': f_sqrt_Ap_fid,
         'f_sigmar_fid': fsigmar_fid, 'n_fid': n_fid, 'f_fid': f_fid, 
-        'sigma8_fid': sigma8_fid, 'fsigma8_fid': fsigma8_fid
+        'sigma8_fid': sigma8_fid, 'fsigma8_fid': fsigma8_fid, 
+        'sigmar_fid': sigmar_fid
     }
 
 # ── BAO template ──────────────────────────────────────────────────────────────
@@ -612,6 +612,7 @@ class ShapeFitSpectrum2Template(Spectrum2Template):
         self._Ap_fid = float(fiducials['Ap_fid'])
         self._m_fid = float(fiducials['m_fid'])
         self._n_fid = float(fiducials['n_fid'])
+        self._sigmar_fid = float(fiducials['sigmar_fid'])
 
     def _qpar_qper(self):
         if self._apmode == 'qparqper':
@@ -1501,9 +1502,10 @@ class ShapeFitExtractor(BAOExtractor):
         self.kp = float(kp)
         self.a = float(a)
         self.n_varied = bool(n_varied)
-        if dfextractor not in ['Ap', 'fsigmar']:
-            raise ValueError(f"dfextractor must be one of ['Ap', 'fsigmar'], found {dfextractor}")
+        if dfextractor not in ['Ap', 'fsigmar', 'f']:
+            raise ValueError(f"dfextractor must be one of ['Ap', 'fsigmar', 'f'], found {dfextractor}")
         self.dfextractor = dfextractor
+        self.logger.info(f"Using dfectractor = {dfextractor}")
         self.r = float(r)
         self.with_now = with_now
 
@@ -1525,6 +1527,8 @@ class ShapeFitExtractor(BAOExtractor):
         
         # Add ShapeFit-specific requirements to the cosmology provider
         reqs = {
+            'params.n_s': None,
+            'thermodynamics.rs_drag': None,
             'fourier.sigma8_z': [
                 {'of': 'delta_cb', 'z': self.z},
                 {'of': 'theta_cb', 'z': self.z},
@@ -1547,6 +1551,8 @@ class ShapeFitExtractor(BAOExtractor):
         self.Ap_fid = fiducials['Ap_fid']
         self.f_sqrt_Ap_fid = fiducials['f_sqrt_Ap_fid']
         self.f_sigmar_fid = fiducials['f_sigmar_fid']
+        self.f_fid = fiducials['f_fid']
+        self._sigmar_fid = float(fiducials['sigmar_fid'])
 
     def __call__(self):
         # 1. Compute standard BAO parameters (DH/rd, qpar, qper, etc.)
@@ -1558,9 +1564,12 @@ class ShapeFitExtractor(BAOExtractor):
         self.sigma8 = sigma8
         self.fsigma8 = fsigma8
         self.f = fsigma8 / sigma8
-        self.n = self.cosmo.get('n_s')
         
-        s = self.cosmo.rs_drag / self._fiducial.rs_drag
+        #self.n = self.cosmo.get('n_s')
+        self.n = self.cosmo.get('params.n_s')
+        
+        
+        s = self.cosmo.get('thermodynamics.rs_drag') / self._fiducial.rs_drag
         kp = self.kp / s
         
         # 3. Get no-wiggle power spectrum on the fine grid
@@ -1593,22 +1602,33 @@ class ShapeFitExtractor(BAOExtractor):
         self.Ap = 1. / s**3 * pknow_kp
         self.f_sqrt_Ap = self.f * self.Ap**0.5
         
-        # 5. Compute f_sigmar using JAX-traceable integration
+        # 5. Compute f_sigmar using the analytic approximation (Eq. A.12)
         dm = self.m - self.m_fid
-        r_phys = self.r * s
-        sigmar = _integrate_sigma_r2_jax(r_phys, pknow_dd_fine, self._k_fine)**0.5
-        self.f_sigmar = self.f * sigmar * jnp.exp(dm / (2 * self.a) * jnp.tanh(self.a * self._fiducial.rs_drag / self.r))
+        dn = self.n - self.n_fid
+        dAp = self.Ap / self.Ap_fid
+        # Analytic approximation for (sigmar / sigmar_fid)^2
+        tanh_arg = self.a * jnp.log(self._fiducial.rs_drag / self.r)
+        dsigmar_sq = dAp * jnp.exp((dm + dn) / self.a * jnp.tanh(tanh_arg))
+        dsigmar = jnp.sqrt(dsigmar_sq)
+        
+        self.sigmar = self._sigmar_fid * dsigmar
+        self.f_sigmar = self.f * self.sigmar
         
         # 6. Compute relative ShapeFit parameters
-        self.dn = self.n - self.n_fid
+        self.dn = dn
         self.dm = dm
-        self.dA = self.Ap / self.Ap_fid
+        self.dAp = dAp
         
         if self.dfextractor == 'Ap':
-            self.df = self.f_sqrt_Ap / self.f_sqrt_Ap_fid / self.dA**0.5
+            self.df = self.f_sqrt_Ap / self.f_sqrt_Ap_fid / self.dAp**0.5
+        elif self.dfextractor == 'f':
+            self.df = self.f / self.f_fid
         else:
-            self.df = self.f_sigmar / self.f_sigmar_fid / self.dA**0.5
+            # df = (f_sigmar / f_sigmar_fid) / dsigmar -> isolates f / f_fid
+            self.df = self.f_sigmar / self.fsigmar_fid / dsigmar
             
+
+        #jax.debug.print("dm = {} df = {} dAp = {} dn = {}", self.dm, self.df, self.dAp, self.dn)
         return self
 
     def tree_flatten(self):
@@ -1625,7 +1645,7 @@ class ShapeFitExtractor(BAOExtractor):
         # Append ShapeFit dynamic leaves
         return leaves + [self.sigma8, self.fsigma8, self.f, self.n,
                          self.m, self.Ap, self.f_sqrt_Ap, self.f_sigmar,
-                         self.dn, self.dm, self.dA, self.df], aux
+                         self.dn, self.dm, self.dAp, self.df], aux
 
     @classmethod
     def tree_unflatten(cls, aux, children):
@@ -1635,7 +1655,7 @@ class ShapeFitExtractor(BAOExtractor):
         # Unflatten ShapeFit attributes (next 12 children)
         (obj.sigma8, obj.fsigma8, obj.f, obj.n,
          obj.m, obj.Ap, obj.f_sqrt_Ap, obj.f_sigmar,
-         obj.dn, obj.dm, obj.dA, obj.df) = children[8:]
+         obj.dn, obj.dm, obj.dAp, obj.df) = children[8:]
          
         # Restore static parameters
         obj.kp = aux['kp']

@@ -527,7 +527,6 @@ class ParameterPrior:
     def _setup(self):
         """Build JAX logpdf/sample closures and compute moments (via scipy, once at init)."""
         dist, (lo, hi), attrs = self.dist, self.limits, self.attrs
-
         # ── uniform ──────────────────────────────────────────────────────────
         if dist == 'uniform':
             self._is_proper = np.isfinite(lo) and np.isfinite(hi)

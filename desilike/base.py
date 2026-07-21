@@ -191,6 +191,7 @@ class GaussianLikelihood(Likelihood):
 
     def __call__(self):
         r = self.flatdata - self.flattheory
+        jax.debug.print("data = {}, theory = {}", self.flatdata, self.flattheory)
         self.logpdf = -0.5 * r @ self.precision @ r
         return self.logpdf
 
@@ -1581,6 +1582,7 @@ def get_params(node_or_graph, level=None) -> VariableCollection:
                     raise ValueError(f'Variable {dep.name!r} appears as distinct objects in multiple nodes; pass the same instance')
                 seen_ids.add(id(dep))
                 result.set(dep)
+    
     return result
 
 
