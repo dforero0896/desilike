@@ -191,7 +191,7 @@ class GaussianLikelihood(Likelihood):
 
     def __call__(self):
         r = self.flatdata - self.flattheory
-        jax.debug.print("data = {}, theory = {}", self.flatdata, self.flattheory)
+        #jax.debug.print("data = {}, theory = {}", self.flatdata, self.flattheory)
         self.logpdf = -0.5 * r @ self.precision @ r
         return self.logpdf
 

@@ -542,13 +542,13 @@ class ShapeFitSpectrum2Template(Spectrum2Template):
         """
         return propose_params_multitracer(
             _ap_auto_params(apmode) + [
-                Parameter('df', value=1., prior=dict(limits=[0., 2.]),
+                Parameter('df', value=1., prior=dict(limits=[0., 20.]),
                           ref=dict(dist='norm', loc=1., scale=0.05), fd_eps=0.02, latex=r'\delta f'),
                 Parameter('dm', value=0., prior=dict(limits=[-0.5, 0.5]),
                           ref=dict(dist='norm', loc=0., scale=0.05), fd_eps=0.01, latex=r'\delta m'),
                 Parameter('dn', value=0., fixed=True, prior=dict(limits=[-0.5, 0.5]),
                           ref=dict(dist='norm', loc=0., scale=0.05), fd_eps=0.01, latex=r'\delta n'),
-                Parameter('dAp', value=1., prior=dict(limits=[0., 2.]),
+                Parameter('dA', value=1., prior=dict(limits=[0., 20.]),
                           ref=dict(dist='norm', loc=1., scale=0.05), fd_eps=0.02, latex=r'\delta A_{p}'),
             ], tracers=None)
 
@@ -635,11 +635,11 @@ class ShapeFitSpectrum2Template(Spectrum2Template):
         dm = self.dm.value
         dn = self.dn.value
         df = self.df.value
-        dAp = self.dAp.value
+        dA = self.dA.value
         factor = jnp.exp(dm / self._a * jnp.tanh(self._a * jnp.log(self.k / self._kp))
                          + dn * jnp.log(self.k / self._kp))
-        self.pk_dd = dAp * self._pk_dd_fid * factor
-        self.pknow_dd = dAp * self._pknow_dd_fid * factor
+        self.pk_dd = dA * self._pk_dd_fid * factor
+        self.pknow_dd = dA * self._pknow_dd_fid * factor
         if self._only_now:
             self.pk_dd = self.pknow_dd
         self.f = self._f_fid * df
@@ -649,9 +649,9 @@ class ShapeFitSpectrum2Template(Spectrum2Template):
         self.qpar = qpar
         self.qper = qper
         # Update sigma8 & fsigma8 using Eq. A.12 ---
-        # (sigma_s8 / sigma_s8_fid)^2 = dAp * exp((dm + dn)/a * tanh(a * ln(r_d_fid / 8)))
+        # (sigma_s8 / sigma_s8_fid)^2 = dA * exp((dm + dn)/a * tanh(a * ln(r_d_fid / 8)))
         tanh_arg = self._a * jnp.log(self._rs_drag_fid / 8.)
-        dsigma8 = dAp * jnp.exp((dm + dn) / self._a * jnp.tanh(tanh_arg))
+        dsigma8 = dA * jnp.exp((dm + dn) / self._a * jnp.tanh(tanh_arg))
         
         self.sigma8 = self._sigma8_fid * jnp.sqrt(dsigma8)
         self.fsigma8 = self.f * self.sigma8
@@ -661,7 +661,7 @@ class ShapeFitSpectrum2Template(Spectrum2Template):
 
 
          # --- NEW: Compute and expose physical ShapeFit parameters ---
-        self.Ap = dAp * self._Ap_fid
+        self.Ap = dA * self._Ap_fid
         self.m = self._m_fid + dm
         self.n = self._n_fid + dn
         self.f_sqrt_Ap = self.f * self.Ap**0.5
@@ -1605,10 +1605,10 @@ class ShapeFitExtractor(BAOExtractor):
         # 5. Compute f_sigmar using the analytic approximation (Eq. A.12)
         dm = self.m - self.m_fid
         dn = self.n - self.n_fid
-        dAp = self.Ap / self.Ap_fid
+        dA = self.Ap / self.Ap_fid
         # Analytic approximation for (sigmar / sigmar_fid)^2
         tanh_arg = self.a * jnp.log(self._fiducial.rs_drag / self.r)
-        dsigmar_sq = dAp * jnp.exp((dm + dn) / self.a * jnp.tanh(tanh_arg))
+        dsigmar_sq = dA * jnp.exp((dm + dn) / self.a * jnp.tanh(tanh_arg))
         dsigmar = jnp.sqrt(dsigmar_sq)
         
         self.sigmar = self._sigmar_fid * dsigmar
@@ -1617,10 +1617,10 @@ class ShapeFitExtractor(BAOExtractor):
         # 6. Compute relative ShapeFit parameters
         self.dn = dn
         self.dm = dm
-        self.dAp = dAp
+        self.dA = dA
         
         if self.dfextractor == 'Ap':
-            self.df = self.f_sqrt_Ap / self.f_sqrt_Ap_fid / self.dAp**0.5
+            self.df = self.f_sqrt_Ap / self.f_sqrt_Ap_fid / self.dA**0.5
         elif self.dfextractor == 'f':
             self.df = self.f / self.f_fid
         else:
@@ -1628,7 +1628,7 @@ class ShapeFitExtractor(BAOExtractor):
             self.df = self.f_sigmar / self.fsigmar_fid / dsigmar
             
 
-        #jax.debug.print("dm = {} df = {} dAp = {} dn = {}", self.dm, self.df, self.dAp, self.dn)
+        #jax.debug.print("dm = {} df = {} dA = {} dn = {}", self.dm, self.df, self.dA, self.dn)
         return self
 
     def tree_flatten(self):
@@ -1645,7 +1645,7 @@ class ShapeFitExtractor(BAOExtractor):
         # Append ShapeFit dynamic leaves
         return leaves + [self.sigma8, self.fsigma8, self.f, self.n,
                          self.m, self.Ap, self.f_sqrt_Ap, self.f_sigmar,
-                         self.dn, self.dm, self.dAp, self.df], aux
+                         self.dn, self.dm, self.dA, self.df], aux
 
     @classmethod
     def tree_unflatten(cls, aux, children):
@@ -1655,7 +1655,7 @@ class ShapeFitExtractor(BAOExtractor):
         # Unflatten ShapeFit attributes (next 12 children)
         (obj.sigma8, obj.fsigma8, obj.f, obj.n,
          obj.m, obj.Ap, obj.f_sqrt_Ap, obj.f_sigmar,
-         obj.dn, obj.dm, obj.dAp, obj.df) = children[8:]
+         obj.dn, obj.dm, obj.dA, obj.df) = children[8:]
          
         # Restore static parameters
         obj.kp = aux['kp']
