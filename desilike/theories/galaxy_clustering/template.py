@@ -489,6 +489,28 @@ class FixedSpectrum2Template(Spectrum2Template):
         obj.k = aux['k']
         return obj
 
+def _tophat_sq(x):
+    """Squared spherical top-hat window [3 j1(x)/x]^2, safe at x -> 0."""
+    x = jnp.asarray(x)
+    small = x < 1e-3
+    x_safe = jnp.where(small, 1.0, x)
+    w = 3.0 * (jnp.sin(x_safe) - x_safe * jnp.cos(x_safe)) / x_safe ** 3
+    w_small = 1.0 - x * x / 10.0 + x ** 4 / 280.0
+    return jnp.where(small, w_small, w) ** 2
+
+def sigma8_sq_weights(k, R=8.0):
+    r"""Trapezoidal weights w such that ``sigma8**2 = sum(w * pk)`` on a log-spaced grid.
+
+    Computes :math:`w_i = k_i^3 \, W_{\rm TH}^2(k_i R) \, \Delta(\ln k)_i`
+    with ``\Delta(\ln k)_i`` the composite-trapezoid edge weights.
+    """
+    k = np.asarray(k, dtype='f8')
+    logk = np.log(k)
+    dw = np.empty_like(logk)
+    dw[0]  = 0.5 * (logk[1]  - logk[0])
+    dw[-1] = 0.5 * (logk[-1] - logk[-2])
+    dw[1:-1] = 0.5 * (logk[2:] - logk[:-2])
+    return k ** 3 * np.asarray(_tophat_sq(k * R)) * dw
 
 class ShapeFitSpectrum2Template(Spectrum2Template):
     r"""
@@ -616,6 +638,9 @@ class ShapeFitSpectrum2Template(Spectrum2Template):
             self._pknow_dd_fid = self._pk_dd_fid
         self.sigma8_fid = jnp.asarray(self._sigma8_fid)
 
+        self._s8_weights = sigma8_sq_weights(self.k, R=8.0)
+        self._s8_fid_sq  = float(jnp.sum(self._s8_weights * self._pk_dd_fid))
+
     def _qpar_qper(self):
         if self._apmode == 'qparqper':
             return self.params['qpar'].value, self.params['qper'].value
@@ -651,10 +676,9 @@ class ShapeFitSpectrum2Template(Spectrum2Template):
         qpar, qper = self._qpar_qper()
         self.qpar = qpar
         self.qper = qper
-        tanh_arg = self._a * jnp.log(self._rs_drag_fid / 8.)
-        sigma8_sq_ratio = dA * jnp.exp((dm + dn) / self._a * jnp.tanh(tanh_arg))
-        self.sigma8 = self._sigma8_fid * jnp.sqrt(sigma8_sq_ratio)
-        self.fsigma8 = self._fsigma8_fid * df * jnp.sqrt(sigma8_sq_ratio / dA)
+        s_tilted = jnp.sum(self._s8_weights * self.pk_dd)
+        self.sigma8 = self._sigma8_fid * jnp.sqrt(s_tilted / self._s8_fid_sq)
+        self.fsigma8 = self.f * self.sigma8
         self.sigma8_fid = jnp.asarray(self._sigma8_fid)
         return self.pk_dd
 
