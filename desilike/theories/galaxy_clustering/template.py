@@ -516,7 +516,23 @@ class ShapeFitSpectrum2Template(Spectrum2Template):
     r"""
     ShapeFit power spectrum template.
 
-    Multiplies the fiducial power spectrum by a k-dependent tilt factor controlled by ``dm``, ``dn`` and ``dA``.
+    Multiplies the fiducial power spectrum by a k-dependent tilt factor controlled by ``dm``, ``dn``,
+    ``dc``, ``deps``, ``dgam`` and ``dA``:
+
+    .. math::
+
+        P^{\rm now}(k) \longrightarrow P^{\rm now}\!\left(k e^{-\delta\epsilon}\right)\,
+        \exp\!\left[\frac{\delta m}{a} \tanh(a \ln(k/k_p)) + \delta n \ln(k/k_p)
+        + \frac{\delta c}{2} \ln^2(k/k_p)\right]
+
+    and the wiggly spectrum is obtained by multiplying the (possibly dilated) no-wiggle one by the
+    fiducial wiggle factor :math:`W(k) = P_{\rm fid}/P^{\rm now}_{\rm fid}` raised to
+    :math:`1 + \delta\gamma`, so that ``dgam`` rescales the BAO wiggle / baryon-suppression depth
+    (a :math:`\omega_b/\omega_m`-like ratio, blind to :math:`h` and :math:`n_s`) and ``deps`` shifts
+    the broadband (equality) scale relative to the wiggle phase (a :math:`k_{\rm eq}/r_d`-like ratio,
+    also blind to :math:`h` and :math:`n_s`).  ``dc`` is the curvature of :math:`\ln P` at the pivot.
+    All three are fixed to their (null) default value, so the default behaviour is exactly the
+    Brieden, Gil-Marin & Verde (2021) parameterization; see https://arxiv.org/abs/2106.07641.
 
     Parameters
     ----------
@@ -555,8 +571,10 @@ class ShapeFitSpectrum2Template(Spectrum2Template):
 
     #: ``df`` scales f, f0 and fk alike, so the fk / f0 shape the loop tables are invariant
     #: under does not move with it; ``dA`` multiplies pk_dd and (sigma8 / sigma8_fid)^2 by the
-    #: same factor, so it cancels in the amplitude division.  ``dm`` and ``dn`` tilt the
-    #: spectrum and are the only parameters an exact-scaling emulator has to expand.
+    #: same factor, so it cancels in the amplitude division.  ``dm``, ``dn`` and ``dc`` tilt the
+    #: spectrum (slope, scale-free tilt, curvature at the pivot), ``deps`` dilates the broadband
+    #: relative to the wiggle phase and ``dgam`` rescales the wiggle depth; they are the only
+    #: parameters an exact-scaling emulator has to expand.
     _extra_scaling_params = ('df', 'dA')
 
     @classmethod
@@ -586,6 +604,12 @@ class ShapeFitSpectrum2Template(Spectrum2Template):
                           ref=dict(dist='norm', loc=0., scale=0.05), fd=dict(eps=0.01), latex=r'\delta n'),
                 Parameter('dA', value=1., fixed=True, prior=dict(limits=[0., 2.]),
                           ref=dict(dist='norm', loc=1., scale=0.05), fd=dict(eps=0.02), latex=r'\delta A_{p}'),
+                Parameter('dc', value=0., fixed=True, prior=dict(limits=[-1., 1.]),
+                          ref=dict(dist='norm', loc=0., scale=0.05), fd=dict(eps=0.01), latex=r'\delta c'),
+                Parameter('deps', value=0., fixed=True, prior=dict(limits=[-0.3, 0.3]),
+                          ref=dict(dist='norm', loc=0., scale=0.02), fd=dict(eps=0.005), latex=r'\delta \epsilon'),
+                Parameter('dgam', value=0., fixed=True, prior=dict(limits=[-1., 1.]),
+                          ref=dict(dist='norm', loc=0., scale=0.05), fd=dict(eps=0.01), latex=r'\delta \gamma'),
             ], tracers=None)
 
     def __init__(self, k=None, z=1., fiducial='DESI', with_now='peakaverage',
@@ -640,6 +664,18 @@ class ShapeFitSpectrum2Template(Spectrum2Template):
 
         self._s8_weights = sigma8_sq_weights(self.k, R=8.0)
         self._s8_fid_sq  = float(jnp.sum(self._s8_weights * self._pk_dd_fid))
+        # Fine grid of the fiducial no-wiggle spectrum, to evaluate the broadband-only dilation
+        # ``deps`` (interpolation in ln k), and the fiducial wiggle factor for ``dgam``.  Both are
+        # ratios to the same quantity evaluated at deps = 0, so the baseline is exactly recovered.
+        k_fine = np.geomspace(self.k.min() / 3., self.k.max() * 3., 1500)
+        if with_now:
+            pknow_fine = bao_filter.smooth_pk_interpolator()(k_fine)
+        else:
+            pknow_fine = pk_interp(k_fine)
+        self._log_k_fine = np.log(k_fine)
+        self._log_pknow_fine = np.log(pknow_fine)
+        self._log_pknow_at_k = np.interp(np.log(self.k), self._log_k_fine, self._log_pknow_fine)
+        self._log_wiggle = np.log(self._pk_dd_fid / self._pknow_dd_fid)
 
     def _qpar_qper(self):
         if self._apmode == 'qparqper':
@@ -661,13 +697,22 @@ class ShapeFitSpectrum2Template(Spectrum2Template):
     def __call__(self):
         dm = self.dm.value
         dn = self.dn.value
+        dc = self.dc.value
+        deps = self.deps.value
+        dgam = self.dgam.value
         df = self.df.value
         dA = self.dA.value
         sqrt_dA = jnp.sqrt(dA)
-        factor = dA * jnp.exp(dm / self._a * jnp.tanh(self._a * jnp.log(self.k / self._kp))
-                         + dn * jnp.log(self.k / self._kp))
-        self.pk_dd = self._pk_dd_fid * factor
-        self.pknow_dd = self._pknow_dd_fid * factor
+        log_k_over_pivot = jnp.log(self.k / self._kp)
+        tilt = jnp.exp(dm / self._a * jnp.tanh(self._a * log_k_over_pivot)
+                       + dn * log_k_over_pivot
+                       + 0.5 * dc / self._a**2 * jnp.tanh(self._a * log_k_over_pivot)**2)
+        # broadband-only dilation: ratio to the same interpolation at deps = 0, so that the
+        # baseline (deps = 0) reproduces the fiducial no-wiggle spectrum exactly
+        log_pknow_shifted = jnp.interp(jnp.log(self.k) - deps, self._log_k_fine, self._log_pknow_fine)
+        broadband_ratio = jnp.exp(log_pknow_shifted - self._log_pknow_at_k)
+        self.pknow_dd = self._pknow_dd_fid * dA * tilt * broadband_ratio
+        self.pk_dd = self.pknow_dd * jnp.exp((1. + dgam) * self._log_wiggle)
         if self._only_now:
             self.pk_dd = self.pknow_dd
         self.f = self._f_fid * df / sqrt_dA
@@ -1567,6 +1612,12 @@ class ShapeFitTheory(BAOTheory):
         ShapeFit slope, primordial index and power-spectrum amplitude parameters.
     dm, dn, df, dA : JAX scalar
         Ratios / differences relative to the fiducial cosmology.
+    dc, deps, dgam : JAX scalar
+        Extra shape parameters, relative to the fiducial cosmology: ``dc`` is the curvature
+        (second log-derivative) of the no-wiggle spectrum at the pivot; ``deps`` is the shift of
+        the no-wiggle turn-over relative to the BAO dilation s (a k_eq/r_d-like ratio); ``dgam``
+        is the change in the RMS wiggle depth ln(P/P_now) (an omega_b/omega_m-like ratio).
+        Both ``deps`` and ``dgam`` are blind to h and n_s by construction.
     Plus all :class:`BAOTheory` attributes (``qpar``, ``qper``, ``qiso``, ``qap``, ...).
 
     Reference
@@ -1585,8 +1636,16 @@ class ShapeFitTheory(BAOTheory):
         # k grid on which the no-wiggle power spectrum is requested: wide enough to bracket
         # the shifted pivot kp * s for any plausible rd / rd_fid ratio
         self._k_pivot_grid = np.geomspace(self._kp / 3., self._kp * 3., 100)
+        # k grid bracketing the no-wiggle turn-over (equality scale), to form the
+        # broadband-vs-wiggle relative shift ``deps`` (a k_eq / r_d-like ratio)
+        self._k_turn_grid = np.geomspace(0.004, 0.06, 48)
+        # k grid over which the BAO wiggle / baryon-suppression depth ``dgam`` is measured
+        self._k_wiggle_grid = np.geomspace(0.04, 0.35, 48)
         requirements = {
-            'fourier.pk_now': [{'of': 'delta_cb', 'engine': str(with_now), 'z': self.z, 'k': self._k_pivot_grid}],
+            'fourier.pk_now': [{'of': 'delta_cb', 'engine': str(with_now), 'z': self.z, 'k': self._k_pivot_grid},
+                               {'of': 'delta_cb', 'engine': str(with_now), 'z': self.z, 'k': self._k_turn_grid},
+                               {'of': 'delta_cb', 'engine': str(with_now), 'z': self.z, 'k': self._k_wiggle_grid}],
+            'fourier.pk': [{'of': 'delta_cb', 'z': self.z, 'k': self._k_wiggle_grid}],
             'fourier.sigma8_z': [{'of': 'delta_cb', 'z': self.z}, {'of': 'theta_cb', 'z': self.z}],
             'params.n_s': None,
         }
@@ -1602,6 +1661,12 @@ class ShapeFitTheory(BAOTheory):
         prim_fid = self._fiducial.get_primordial().pk_interpolator()(self._k_pivot_grid) * self._k_pivot_grid if self._n_varied else None
         self._m_fid = float(self._log_slope(pknow_fid, pk_prim=prim_fid, kp=self._kp))
         self._n_fid = float(self._fiducial.n_s)
+        self._dc_fid = float(self._log_curvature(pknow_fid, pk_prim=prim_fid, kp=self._kp))
+        pknow_turn_fid = bao_filter.smooth_pk_interpolator().to_1d(z=self.z)(self._k_turn_grid)
+        pknow_wig_fid = bao_filter.smooth_pk_interpolator().to_1d(z=self.z)(self._k_wiggle_grid)
+        pk_wig_fid = pk_interp.to_1d(z=self.z)(self._k_wiggle_grid)
+        self._log_k_turn_fid = float(self._log_k_turnover(pknow_turn_fid, self._n_fid))
+        self._wiggle_rms_fid = float(self._wiggle_rms(pk_wig_fid, pknow_wig_fid))
         sigma8_fid = fo.sigma8_z(self.z, of='delta_cb')
         fsigma8_fid = fo.sigma8_z(self.z, of='theta_cb')
         Ap_fid = jnp.exp(jnp.interp(np.log(self._kp), np.log(self._k_pivot_grid), np.log(pknow_fid)))
@@ -1619,6 +1684,31 @@ class ShapeFitTheory(BAOTheory):
         log_pknow_pivots = jnp.interp(logk_pivots, np.log(self._k_pivot_grid), log_pknow)
         return (log_pknow_pivots[1] - log_pknow_pivots[0]) / (logk_pivots[1] - logk_pivots[0])
 
+    def _log_curvature(self, pknow, pk_prim=None, kp=None):
+        """Second log-derivative of *pknow* (divided by the primordial ``pk * k`` when
+        ``n_varied``) at *kp*: the ShapeFit curvature parameter ``c``."""
+        log_pknow = jnp.log(pknow)
+        if pk_prim is not None:
+            log_pknow = log_pknow - jnp.log(pk_prim)
+        dlogk = 5e-2
+        logk_pivots = jnp.log(kp) + dlogk * jnp.array([-1., 0., 1.])
+        log_pknow_pivots = jnp.interp(logk_pivots, np.log(self._k_pivot_grid), log_pknow)
+        return (log_pknow_pivots[0] + log_pknow_pivots[2] - 2. * log_pknow_pivots[1]) / dlogk ** 2
+
+    def _log_k_turnover(self, pknow_turn, n_s):
+        """ln k of the turn-over (zero of the log-slope) of the *tilt-free* no-wiggle spectrum,
+        i.e. of P_now(k) (k/k_p)^(-(n_s-1)), by interpolation of the (monotonically decreasing)
+        log-slope on ``_k_turn_grid``.  Removing the primordial tilt makes the result blind to
+        n_s, so that ``deps`` is a pure early-universe (k_eq / r_d-like) ratio."""
+        logk = jnp.log(self._k_turn_grid)
+        log_pknow = jnp.log(pknow_turn)
+        slope = (log_pknow[2:] - log_pknow[:-2]) / (logk[2:] - logk[:-2]) - (n_s - 1.)
+        return jnp.interp(0., slope[::-1], logk[1:-1][::-1])
+
+    def _wiggle_rms(self, pk, pknow):
+        """RMS of ln(pk / pknow) over ``_k_wiggle_grid``: a wiggle / baryon-suppression depth."""
+        return jnp.sqrt(jnp.mean((jnp.log(pk) - jnp.log(pknow)) ** 2))
+
     def __call__(self):
         super().__call__()
         rd = self.cosmo.get_thermodynamics().rs_drag
@@ -1630,6 +1720,17 @@ class ShapeFitTheory(BAOTheory):
         self.n = self.cosmo.get('params.n_s')
         self.dm = self.m - self._m_fid
         self.dn = self.n - self._n_fid
+        self.dc = self._log_curvature(pknow, pk_prim=pk_prim, kp=kp) - self._dc_fid
+        pknow_turn = self.cosmo.get('fourier.pk_now', of='delta_cb', engine=self._with_now, z=self.z, k=self._k_turn_grid)
+        pknow_wig = self.cosmo.get('fourier.pk_now', of='delta_cb', engine=self._with_now, z=self.z, k=self._k_wiggle_grid)
+        pk_wig = self.cosmo.get('fourier.pk', of='delta_cb', z=self.z, k=self._k_wiggle_grid)
+        # broadband (equality) scale relative to the wiggle phase, in the data frame: the
+        # template dilates the no-wiggle part by e^deps on top of the classic AP dilation, so
+        # deps tracks ln(k_eq * r_d) relative to fiducial -- blind to h and to n_s
+        self.deps = (self._log_k_turnover(pknow_turn, self.n) - self._log_k_turn_fid) + jnp.log(s)
+        # BAO wiggle / baryon-suppression depth relative to fiducial: an omega_b / omega_m-like
+        # ratio, blind to h and n_s
+        self.dgam = jnp.log(self._wiggle_rms(pk_wig, pknow_wig) / self._wiggle_rms_fid)
         sigma8 = self.cosmo.get('fourier.sigma8_z', of='delta_cb', z=self.z)
         fsigma8 = self.cosmo.get('fourier.sigma8_z', of='theta_cb', z=self.z)
         # Eq. 3.11 of https://arxiv.org/abs/2106.07641
@@ -1643,14 +1744,16 @@ class ShapeFitTheory(BAOTheory):
 
     def tree_flatten(self):
         leaves, aux = super().tree_flatten()
-        return leaves + [self.m, self.n, self.dm, self.dn, self.df, self.f_sqrt_Ap, self.Ap, self.dA], aux
+        return leaves + [self.m, self.n, self.dm, self.dn, self.df, self.f_sqrt_Ap, self.Ap, self.dA,
+                         self.dc, self.deps, self.dgam], aux
 
     @classmethod
     def tree_unflatten(cls, aux, children):
         obj = object.__new__(cls)
         (obj.DH_over_rd, obj.DM_over_rd, obj.DH_over_DM, obj.DV_over_rd, obj.F_AP,
          obj.qpar, obj.qper, obj.qiso, obj.qap,
-         obj.m, obj.n, obj.dm, obj.dn, obj.df, obj.f_sqrt_Ap, obj.Ap, obj.dA) = children
+         obj.m, obj.n, obj.dm, obj.dn, obj.df, obj.f_sqrt_Ap, obj.Ap, obj.dA,
+         obj.dc, obj.deps, obj.dgam) = children
         obj.z = aux['z']
         return obj
 
