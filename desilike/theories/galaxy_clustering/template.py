@@ -64,6 +64,7 @@ from ..primordial_cosmology import CosmoprimoCosmology, _get_fiducial
 # callers have always read them off this module
 from cosmoprimo.emulators.analytic import fourier_analytic_scales  # noqa: F401
 from ._multitracer import propose_params_multitracer, assign_params
+from .wiggle import get_wiggle_estimator, default_fine_grid as _wiggle_fine_grid
 
 
 _kw_pk = dict(extrap_kmin=1e-7, extrap_kmax=1e2)  # cosmoprimo pk_interpolator kwargs
@@ -1649,6 +1650,23 @@ class ShapeFitTheory(BAOTheory):
         Fiducial cosmology used to normalise the ratios.
     cosmo : PrimordialCosmology, optional
         Cosmology provider; a :class:`CosmoprimoCosmology` is created if not given.
+    gam_estimator : str, default='rms_phase_detrend'
+        How ``dgam`` is extracted from the cosmology; one of the three estimators in
+        :mod:`desilike.theories.galaxy_clustering.wiggle`, all of them the RMS of ln W over a
+        window fixed in phase x = k r_d (so a pure change of r_d gives dgam = 0):
+        'rms_phase_detrend' (default) additionally removes a cubic polynomial in ln k, which
+        makes it insensitive to smooth P / P_now mismatch (|dgam - dgam_ML| <= 0.04 sigma over
+        the validation suite); 'rms_phase' is the bare phase-anchored RMS (<= 0.07 sigma for
+        variations within current bounds); 'rms_legacy' reproduces the original
+        shapefit-prime definition bit-for-bit (fixed k window, ln-ratio convention) for
+        existing chains.  More elaborate definitions (matched-filter and linearised-ML
+        projections, quadrature demodulation, single-peak amplitudes) are kept outside the
+        package as diagnostics: they need configuration choices (a marginalisation set, a
+        reference phase), which a ShapeFit compression parameter should not have.
+    gam_opts : dict, optional
+        Extra options forwarded to the estimator's ``prepare`` (e.g. ``kmin``, ``kmax``,
+        ``n``, ``detrend``, ``weight``, ``x_peak``); unknown keys are ignored, so the same
+        dict can be passed to every estimator.
 
     Attributes
     ----------
@@ -1660,7 +1678,8 @@ class ShapeFitTheory(BAOTheory):
         Extra shape parameters, relative to the fiducial cosmology: ``dc`` is the curvature
         (second log-derivative) of the no-wiggle spectrum at the pivot; ``deps`` is the shift of
         the no-wiggle turn-over relative to the BAO dilation s (a k_eq/r_d-like ratio); ``dgam``
-        is the change in the RMS wiggle depth ln(P/P_now) (an omega_b/omega_m-like ratio).
+        is the change in the BAO wiggle / baryon-suppression depth (an omega_b/omega_m-like
+        ratio, with a calibration of ~1.5, i.e. dgam ~ 1.5 dln(omega_b/omega_m) - 0.4 dln omega_m).
         Both ``deps`` and ``dgam`` are blind to h and n_s by construction.
     Plus all :class:`BAOTheory` attributes (``qpar``, ``qper``, ``qiso``, ``qap``, ...).
 
@@ -1669,27 +1688,33 @@ class ShapeFitTheory(BAOTheory):
     https://arxiv.org/abs/2106.07641, https://arxiv.org/pdf/2212.04522.pdf
     """
 
-    def __init__(self, z=1., eta=1./3., kp=0.03, n_varied=False, with_now='peakaverage', fiducial='DESI', cosmo=None):
-        super().__init__(z=z, eta=eta, fiducial=fiducial, cosmo=cosmo, correction=None)
+    def __init__(self, z=1., eta=1./3., kp=0.03, n_varied=False, with_now='peakaverage', fiducial='DESI',
+                 cosmo=None, gam_estimator='rms_phase_detrend', gam_opts=None):
+        super().__init__(z=z, eta=eta, fiducial=fiducial, cosmo=cosmo)
 
-    def __post_init__(self, z=1., eta=1./3., kp=0.03, n_varied=False, with_now='peakaverage', fiducial='DESI', cosmo=None):
+    def __post_init__(self, z=1., eta=1./3., kp=0.03, n_varied=False, with_now='peakaverage', fiducial='DESI',
+                      cosmo=None, gam_estimator='rms_phase_detrend', gam_opts=None):
         from cosmoprimo import PowerSpectrumBAOFilter
         super().__post_init__(z=z, eta=eta, fiducial=fiducial, cosmo=cosmo, correction=None)
         self._kp = float(kp)
         self._n_varied = bool(n_varied)
         # k grid on which the no-wiggle power spectrum is requested: wide enough to bracket
-        # the shifted pivot kp * s for any plausible rd / rd_fid ratio
-        self._k_pivot_grid = np.geomspace(self._kp / 3., self._kp * 3., 100)
+        # the shifted pivot kp * s for any plausible rd / rd_fid ratio.  600 points rather
+        # than 100: ``dc`` takes a dlogk = 5e-2 second-difference stencil, which on the
+        # 100-point grid spans 2.3 nodes of a *linear* interpolation and carries an O(0.025)
+        # offset -- the size of, and sometimes opposite in sign to, the signal itself.
+        self._k_pivot_grid = np.geomspace(self._kp / 3., self._kp * 3., 600)
         # k grid bracketing the no-wiggle turn-over (equality scale), to form the
         # broadband-vs-wiggle relative shift ``deps`` (a k_eq / r_d-like ratio)
         self._k_turn_grid = np.geomspace(0.004, 0.06, 48)
-        # k grid over which the BAO wiggle / baryon-suppression depth ``dgam`` is measured
-        self._k_wiggle_grid = np.geomspace(0.04, 0.35, 48)
+        # dense static grid from which every wiggle-depth estimator (see wiggle.py)
+        # interpolates ln P and ln P_now onto its own window, fixed in k or in phase x = k r_d
+        self._k_gam_fine = _wiggle_fine_grid()
         requirements = {
             'fourier.pk_now': [{'of': 'delta_cb', 'engine': str(with_now), 'z': self.z, 'k': self._k_pivot_grid},
                                {'of': 'delta_cb', 'engine': str(with_now), 'z': self.z, 'k': self._k_turn_grid},
-                               {'of': 'delta_cb', 'engine': str(with_now), 'z': self.z, 'k': self._k_wiggle_grid}],
-            'fourier.pk': [{'of': 'delta_cb', 'z': self.z, 'k': self._k_wiggle_grid}],
+                               {'of': 'delta_cb', 'engine': str(with_now), 'z': self.z, 'k': self._k_gam_fine}],
+            'fourier.pk': [{'of': 'delta_cb', 'z': self.z, 'k': self._k_gam_fine}],
             'fourier.sigma8_z': [{'of': 'delta_cb', 'z': self.z}, {'of': 'theta_cb', 'z': self.z}],
             'params.n_s': None,
         }
@@ -1707,16 +1732,29 @@ class ShapeFitTheory(BAOTheory):
         self._n_fid = float(self._fiducial.n_s)
         self._dc_fid = float(self._log_curvature(pknow_fid, pk_prim=prim_fid, kp=self._kp))
         pknow_turn_fid = bao_filter.smooth_pk_interpolator().to_1d(z=self.z)(self._k_turn_grid)
-        pknow_wig_fid = bao_filter.smooth_pk_interpolator().to_1d(z=self.z)(self._k_wiggle_grid)
-        pk_wig_fid = pk_interp.to_1d(z=self.z)(self._k_wiggle_grid)
         self._log_k_turn_fid = float(self._log_k_turnover(pknow_turn_fid, self._n_fid))
-        self._wiggle_rms_fid = float(self._wiggle_rms(pk_wig_fid, pknow_wig_fid))
         sigma8_fid = fo.sigma8_z(self.z, of='delta_cb')
         fsigma8_fid = fo.sigma8_z(self.z, of='theta_cb')
         Ap_fid = jnp.exp(jnp.interp(np.log(self._kp), np.log(self._k_pivot_grid), np.log(pknow_fid)))
         self._Ap_fid = float(Ap_fid)
         self._f_sqrt_Ap_fid = float(fsigma8_fid / sigma8_fid * Ap_fid ** 0.5)
         self._rd_fid = float(self._fiducial.rs_drag)
+        # --- wiggle depth (gamma): swappable standalone estimator, see wiggle.py ---------
+        # Each estimator is a (prepare, apply) pair of pure functions: prepare runs here
+        # (numpy, once, may use linear algebra), apply runs in __call__ (pure jax: jnp.interp
+        # plus at most one dot product).  Swap definitions with
+        #   ShapeFitTheory(..., gam_estimator='rms' | 'rms_phase' | 'rms_phase_detrend' |
+        #                        'proj' | 'proj_ml' | 'peak' | 'peak_trough' | 'quad',
+        #                  gam_opts={...})
+        # and compare them with desilike/theories/tests/test_wiggle_estimators.py, which
+        # needs no Boltzmann engine.
+        self._gam_est = get_wiggle_estimator(gam_estimator)
+        log_pk_gam_fid = np.log(pk_interp.to_1d(z=self.z)(self._k_gam_fine))
+        log_pknow_gam_fid = np.log(bao_filter.smooth_pk_interpolator().to_1d(z=self.z)(self._k_gam_fine))
+        self._log_k_gam_fine = jnp.asarray(np.log(self._k_gam_fine))
+        self._gam_state = self._gam_est.prepare(np.log(self._k_gam_fine), log_pk_gam_fid,
+                                                log_pknow_gam_fid, self._rd_fid, kp=self._kp,
+                                                **(gam_opts or {}))
 
     def _log_slope(self, pknow, pk_prim=None, kp=None):
         """Log-slope of *pknow* (divided by the primordial ``pk * k`` when ``n_varied``) at *kp*."""
@@ -1749,10 +1787,6 @@ class ShapeFitTheory(BAOTheory):
         slope = (log_pknow[2:] - log_pknow[:-2]) / (logk[2:] - logk[:-2]) - (n_s - 1.)
         return jnp.interp(0., slope[::-1], logk[1:-1][::-1])
 
-    def _wiggle_rms(self, pk, pknow):
-        """RMS of ln(pk / pknow) over ``_k_wiggle_grid``: a wiggle / baryon-suppression depth."""
-        return jnp.sqrt(jnp.mean((jnp.log(pk) - jnp.log(pknow)) ** 2))
-
     def __call__(self):
         super().__call__()
         rd = self.cosmo.get_thermodynamics().rs_drag
@@ -1766,15 +1800,18 @@ class ShapeFitTheory(BAOTheory):
         self.dn = self.n - self._n_fid
         self.dc = self._log_curvature(pknow, pk_prim=pk_prim, kp=kp) - self._dc_fid
         pknow_turn = self.cosmo.get('fourier.pk_now', of='delta_cb', engine=self._with_now, z=self.z, k=self._k_turn_grid)
-        pknow_wig = self.cosmo.get('fourier.pk_now', of='delta_cb', engine=self._with_now, z=self.z, k=self._k_wiggle_grid)
-        pk_wig = self.cosmo.get('fourier.pk', of='delta_cb', z=self.z, k=self._k_wiggle_grid)
         # broadband (equality) scale relative to the wiggle phase, in the data frame: the
         # template dilates the no-wiggle part by e^deps on top of the classic AP dilation, so
         # deps tracks ln(k_eq * r_d) relative to fiducial -- blind to h and to n_s
         self.deps = (self._log_k_turnover(pknow_turn, self.n) - self._log_k_turn_fid) + jnp.log(s)
         # BAO wiggle / baryon-suppression depth relative to fiducial: an omega_b / omega_m-like
-        # ratio, blind to h and n_s
-        self.dgam = jnp.log(self._wiggle_rms(pk_wig, pknow_wig) / self._wiggle_rms_fid)
+        # ratio, blind to h and n_s.  Pure standalone function pair from wiggle.py; the
+        # estimator itself is chosen by the ``gam_estimator`` keyword (see __post_init__).
+        log_pk_gam = jnp.log(self.cosmo.get('fourier.pk', of='delta_cb', z=self.z, k=self._k_gam_fine))
+        log_pknow_gam = jnp.log(self.cosmo.get('fourier.pk_now', of='delta_cb', engine=self._with_now,
+                                               z=self.z, k=self._k_gam_fine))
+        self.dgam = self._gam_est.apply(self._gam_state, self._log_k_gam_fine, log_pk_gam,
+                                        log_pknow_gam, rd)
         sigma8 = self.cosmo.get('fourier.sigma8_z', of='delta_cb', z=self.z)
         fsigma8 = self.cosmo.get('fourier.sigma8_z', of='theta_cb', z=self.z)
         # Eq. 3.11 of https://arxiv.org/abs/2106.07641
