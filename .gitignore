@@ -20,6 +20,7 @@ docs/api/_autosummary
 **/_results
 **/_chains
 **/tests/_*/
+**/nb/_*/
 **/*.pyc
 **/*.npz
 **/*.npy
