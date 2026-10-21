@@ -709,14 +709,34 @@ class ShapeFitFastSpectrum2Template(ShapeFitSpectrum2Template):
     instead hands the PT the **untilted** fiducial linear power and exposes the tilt factor
     :math:`S(k)` separately through :meth:`get_tilt`.  PT calculators that know their
     per-diagram decomposition (e.g. :class:`KaiserPTSpectrum2Poles`,
-    :class:`TNSPTSpectrum2Poles`) then multiply each term by :math:`S(k)^{p}`, where ``p`` is the
-    number of linear-power factors in that term.  This is the approximation used by BRASS: the
-    loop tables are computed once from the fiducial linear spectrum, and the ShapeFit factor is
-    applied to the loop integral results afterwards.
+    :class:`TNSPTSpectrum2Poles`, :class:`FOLPSPTSpectrum2Poles`) then multiply each term by
+    :math:`S(k)^{p}`, ``p`` being the number of factors of the linear power spectrum in that term:
+
+    * ``p = 1`` -- the tree level, :math:`P_L` (Kaiser's ``pk_dd`` / ``pk_dt`` / ``pk_tt``).
+    * ``p = 2`` -- every 1-loop diagram, :math:`P_{22}` and :math:`P_{13}`, and every 1-loop bias
+      insertion (:math:`b_2 P_L^2`, :math:`b_{s^2} P_L^2`, ...): a bias factor adds no power of
+      :math:`P_L`.
+    * ``p = 3`` -- every 2-loop diagram (:math:`P_{15}`, :math:`P_{24}`, :math:`P_{33}`, ...).
+
+    ``p`` follows the diagram's order in :math:`P_L` only, never the bias order: a :math:`b_2`
+    insertion multiplies a quadratic loop integrand, so it takes two powers like the unbiased
+    1-loop terms.  Terms mixing orders are split before being tilted (TNS keeps ``pk11`` in its
+    own row and tilts the 1-loop remainder of ``pk_dd`` / ``pk_dt`` / ``pk_tt`` separately).
+    Moments of the linear spectrum (``sigma2``-type damping scales) are not tilted.
+
+    This is precisely the BRASS approximation, ``integrals_rsd.c``: the loop tables are computed
+    once from the fiducial linear spectrum, and the ShapeFit factor is applied afterwards with
+    the power of the diagram (``sigma8_scaling`` at L98 for the tree level,
+    ``sigma8_scaling^2`` at L100 for the 1-loop sum and the bias kernels, ``sigma8_scaling^3``
+    at L102/L106 for the 2-loop ones).  Equivalently, BRASS does *not* replace
+    :math:`P_L \to S P_L` inside the integrand -- that would evaluate :math:`S` at the internal
+    momenta -- but rescales the finished integral at the external wavenumber.
 
     The AP distortion (``kap``, ``muap``) is evaluated exactly as in the standard template --
-    ``ap_k_mu`` is inherited unchanged.  The tilt is a function of the AP-distorted wavenumber
-    ``kap`` only, so the two templates differ only in the placement of the tilt.
+    ``ap_k_mu`` is inherited unchanged.  The tilt is a function of the wavenumber the PT
+    evaluates at (``kap`` for a PT that distorts first, the loop-table grid for one that
+    integrates at fixed wavenumbers), so the two templates differ only in the placement of the
+    tilt, not in the AP convention.
 
     Notes
     -----
@@ -772,10 +792,29 @@ class ShapeFitFastSpectrum2Template(ShapeFitSpectrum2Template):
         r"""ShapeFit factor :math:`S(k) = d_A \exp[\Delta m/a \tanh(a \ln k/k_p) + \Delta n \ln k/k_p]`.
 
         Evaluated analytically from the parameters, so it is valid for any wavenumber -- in
-        particular on a PT calculator's own loop grid, which may extend beyond ``self.k``.
-        ``k`` is normally the AP-distorted ``kap``, which is exactly where BRASS evaluates its
-        shape factor; a PT that integrates on a fixed grid (FOLPS) instead samples it on that
-        grid, i.e. at the wavenumbers where its loop integrals live.
+        particular on a PT calculator's own loop grid, which may extend beyond ``self.k`` and
+        beyond the fit range.  This is the same expression, with the same ``k_p = 0.03`` and
+        ``a = 0.6``, as the standard template applies to its linear input; it is simply exposed
+        instead of being folded in.
+
+        Equivalent BRASS code (``brass-python/legacy_csrc_v2/integrals_rsd.c``)::
+
+            shape_factor = exp(m2BGV * log(k1p/(kpivot*aiso))
+                               + mBGV/ascale * tanh(ascale * log(k1p/(kpivot*aiso))))
+            sigma8_scaling = shape_factor * sigma8
+
+        with ``kpivot = 0.03``, ``ascale = 0.6`` and the mapping ``m_BGV`` <-> ``dm``,
+        ``m2_BGV`` <-> ``dn``.  Note the two differences in the argument and in the caller.
+        BRASS divides the AP factor back out, ``k1p/(kpivot*aiso) = k_obs/kpivot``, so it
+        evaluates :math:`S` at the *observed* wavenumber, while here :math:`S` is evaluated at the
+        fiducial-frame wavenumber the PT is evaluated at (``kap`` for Kaiser/TNS), consistently
+        with the standard template; the shift is of order ``q - 1``, i.e. ~1% for
+        ``q_par, q_per ~ 1``.  And BRASS raises ``sigma8_scaling`` to the power of the diagram
+        being computed (1 tree, 2 one-loop, 3 two-loop), whereas this method returns the tilt
+        itself and lets each PT calculator apply its own powers.
+
+        ``k`` is normally the AP-distorted ``kap``; a PT that integrates on a fixed grid (FOLPS)
+        instead samples it on that grid, i.e. at the wavenumbers where its loop integrals live.
         """
         dm = self.dm.value
         dn = self.dn.value

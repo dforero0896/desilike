@@ -479,6 +479,44 @@ def tns_pt(k, q, wq, pk_q, kernel13_d, kernel13_t, kernel_a):
 
 
 # ── ShapeFit tilt hooks ───────────────────────────────────────────────────────
+#
+# Which term gets which power of S(k), and why
+# --------------------------------------------
+# The ShapeFit factor S(k) = dA * exp[(dm/a) tanh(a ln(k/kp)) + dn ln(k/kp)] is, to first order,
+# a multiplicative rescaling of the linear power spectrum.  Replacing P_L -> S P_L *inside* a
+# loop integral would put S at the internal momenta q and |k - q|, which is not what BRASS does.
+# BRASS computes each diagram once from the fiducial linear spectrum and multiplies the *result*
+# by S(k)^n, with n the number of linear-power factors in that diagram and S evaluated at the
+# external wavenumber:
+#
+#     tree level        P_L                              -> S^1 * P_L
+#     1-loop            P_22, P_13                       -> S^2 * (P_22, P_13)
+#     1-loop bias       b_2 P_L^2, b_s2 P_L^2, ...       -> S^2 * (...)
+#     2-loop            P_15, P_24, P_33, ...            -> S^3 * (...)
+#
+# So the tilt is an amplitude of the linear spectrum *at the wavenumber where the observable is
+# evaluated*, not a change of the integrand.  In brass-python/legacy_csrc_v2/integrals_rsd.c this
+# is explicit: shape_factor is formed from m_BGV/m2_BGV at L80-81, folded into
+# sigma8_scaling = shape_factor * sigma8 at L82, and then raised to the diagram's power:
+#   L98   (PT-Model linear)   sigma8_scaling          * P_lin
+#   L100  (1L-SPT)            sigma8_scaling^2        * (P22 + P13)
+#   L102  (2L-SPT)            sigma8_scaling^3        * (2-loop diagrams)
+#   L106  (2L-RPT)            sigma8_scaling^3        * P_2loop, and the same powers appear
+#                                                     inside the N2(...) resummation arguments
+#   L618+ (TNS A/B kernels)   sigma8_scaling^2        * (every bias kernel)
+#
+# Three consequences drive the code below:
+#
+# 1. The exponent follows the diagram's order in P_L only -- never the bias order.  A b_2 term is
+#    b_2 * P_L^2, so it gets S^2, exactly like the unbiased 1-loop terms.
+# 2. A term that mixes orders must be split before it can be tilted.  TNS keeps pk_dd, pk_dt and
+#    pk_tt as (linear + 1-loop) sums in a single row, so those rows are tilted piecewise; FOLPS
+#    keeps one column per diagram and needs no splitting.
+# 3. Moments of the linear spectrum are *not* tilted: BRASS's FoG damping is a free parameter, not
+#    a moment derived from the (tilted) input, so sigma2-type quantities stay at fiducial.
+#
+# The hooks are inert for a standard ShapeFitSpectrum2Template (they return None / do nothing),
+# so a PT calculator can call them unconditionally.
 
 def _raise_if_fast_shapefit_unsupported(template, pt_name):
     """Refuse the BRASS-like template in PT calculators without the per-term tilt hook.
@@ -498,9 +536,21 @@ def _raise_if_fast_shapefit_unsupported(template, pt_name):
 def _fast_shapefit_tilt(template, k):
     """The BRASS-like tilt factor at wavenumbers *k*, or None for a standard template.
 
-    *k* is the AP-distorted ``kap`` for the PT calculators that build their table already
-    distorted (Kaiser, TNS), and the loop table's own grid for one that integrates at fixed
-    wavenumbers and distorts afterwards (FOLPS).
+    *k* is the wavenumber the PT calculator evaluates the tilt at, which differs by calculator
+    because it has to be the wavenumber at which that calculator's diagrams live:
+
+    * :class:`KaiserPTSpectrum2Poles` and :class:`TNSPTSpectrum2Poles` build their table already
+      AP-distorted and then project onto multipoles, so they pass the distorted ``kap``.
+    * :class:`FOLPSPTSpectrum2Poles` integrates its loop table on a fixed fiducial grid and
+      distorts afterwards, so it passes that grid (``table[0]``) and the tilt is applied before
+      folps interpolates the columns onto ``(kap, muap)``.
+
+    ``kap`` is the fiducial-frame wavenumber, the same one at which the standard template applies
+    S to its linear input, so the fast template is consistent with it.  BRASS instead divides the
+    AP factor back out of the argument (``k1p/(kpivot*aiso)`` in ``integrals_rsd.c`` L81, with
+    ``k1p = k_obs * aiso``) and therefore evaluates S at the *observed* wavenumber.  The two
+    differ only by the AP rescaling -- order (q - 1), i.e. ~1% for q_par, q_per ~ 1 -- and the
+    power counting below is unaffected.
     """
     if getattr(template, 'is_fast_shapefit', False):
         return template.get_tilt(k)
@@ -508,13 +558,26 @@ def _fast_shapefit_tilt(template, k):
 
 
 def _tns_apply_fast_tilt(table, tilt):
-    """Apply the BRASS-like tilt to the per-term TNS table, term by term.
+    r"""Apply the BRASS-like tilt to the per-term TNS table, term by term.
 
-    ``table`` has shape ``(29, n_k, n_mu)`` and, in order, holds pk11, pk_dd, the six 1-loop
-    bias terms, pk_dt and its two bias partners, pk_tt, and then the 5 + 12 components of the
-    TNS ``A`` and ``B`` kernels.  ``pk11`` is a separate row, so the linear part of ``pk_dd`` /
-    ``pk_dt`` / ``pk_tt`` is tilted with one power and their 1-loop remainder with two; every
-    bias term and every ``A``/``B`` component carries two factors of the linear power.
+    ``table`` has shape ``(29, n_k, n_mu)``, one row per contribution, in the order of
+    ``tns_pt``.  Each row is tilted with the number of linear-power factors it carries:
+
+    * ``pk11`` -- one power.  It is the only tree-level row.
+    * ``pk_dd``, ``pk_dt``, ``pk_tt`` -- these mix orders (they are ``pk11 + 1-loop``), so the
+      linear part is taken from row ``pk11`` and only the remainder gets two powers.
+    * every other row -- two powers: ``pk_b2d``, ``pk_bs2d``, ``pk_sig3sq``, ``pk_b22``,
+      ``pk_b2s2``, ``pk_bs22``, ``pk_b2t``, ``pk_bs2t``, and the 5 + 12 components of the
+      ``A`` / ``B`` kernels.
+
+    Why: rows 2-7 are single 1-loop bias insertions, each one bias factor times a quantity
+    quadratic in :math:`P_L`; rows 9-10 are the same for the ``dt`` cross terms, row 4 is
+    :math:`\sigma_3^2 P_L` with :math:`\sigma_3^2` linear in :math:`P_L`, and every ``A`` / ``B``
+    component is built from two (or a bias factor times two) linear spectra.  Rows 1, 8 and 11
+    are the only mixed ones: the linear part is pulled out as a separate row (``pk11``), so the
+    remainder is purely 1-loop and takes two powers.  This matches BRASS, whose 1-loop SPT sum
+    is scaled by ``sigma8_scaling^2`` (``integrals_rsd.c`` L100) and whose TNS ``A``/``B`` kernels
+    all carry ``sigma8_scaling^2`` (L618 onwards).
     """
     tilt2 = tilt**2
     linear = table[0]
@@ -526,21 +589,55 @@ def _tns_apply_fast_tilt(table, tilt):
 
 
 def _folps_apply_fast_tilt(table, tilt, A_full):
-    """Apply the BRASS-like tilt to the FOLPS per-diagram loop table, column by column.
+    r"""Apply the BRASS-like tilt to the FOLPS per-diagram loop table, column by column.
 
-    ``table`` is the tuple returned by folps' ``calculate_loop_table``:
-    ``(k, pk_lin, f_k/f_0, <25 loop columns>[, <6 b2/bs2 A-kernel columns], sigma2_w, f_0)``
-    (the no-wiggle table carries two extra scalars before ``f_0``).  ``pk_lin`` is linear in the
-    fiducial linear power and every loop column is quadratic, including the ``P13/pk_lin``
-    pieces, which folps multiplies by ``pk_lin`` before storing them.  ``f_k/f_0`` and ``f_0``
-    are growth factors, and the trailing ``sigma2_w`` (plus the no-wiggle ``sigma2_NW`` /
-    ``delta_sigma2_NW``) are single numbers integrated over the whole linear spectrum rather
-    than loop integrands, so they keep their fiducial values -- as in BRASS, whose FoG damping
-    is a free parameter instead of a moment of the tilted input.
+    ``table`` is the tuple returned by folps' ``calculate_loop_table`` (see
+    ``folps.NonLinearPowerSpectrumCalculator.combine_loop_terms`` for the authoritative order)::
 
-    ``tilt`` is sampled on the table's own k grid, so the factor is applied where the loop
-    integrals were computed -- the BRASS-like operation -- before folps interpolates the table
-    onto ``(kap, muap)``.  The returned tuple keeps folps' element order and shapes.
+        (k, pk_l, Fkoverf0, <25 loop columns>[, <6 b2/bs2 A-kernel columns], sigma2_w, f0)
+
+    with ``table_now`` (no-wiggle) carrying two extra scalars, ``sigma2_NW`` and
+    ``delta_sigma2_NW``, before ``f0``.  Which column takes which power:
+
+    * one power -- ``pk_l``, the fiducial linear spectrum itself.
+    * two powers -- all 25 loop columns: ``Ploop_dd``, ``Ploop_dt``, ``Ploop_tt``, ``Pb1b2``,
+      ``Pb1bs2``, ``Pb22``, ``Pb2bs2``, ``Pb2s2``, ``sigma23pkl``, ``Pb2t``, ``Pbs2t``,
+      ``I1udd_1``, ``I2uud_1``, ``I2uud_2``, ``I3uuu_2``, ``I3uuu_3``, the nine ``I2uudd_1D``
+      ... ``I4uuuu_1_B`` columns, and -- when ``A_full`` is set -- the six b2/bs2 kernel columns
+      ``I1udd_1_b2``, ``I2uud_1_b2``, ``I2uud_2_b2``, ``I1udd_1_bs2``, ``I2uud_1_bs2``,
+      ``I2uud_2_bs2``.
+    * untouched -- ``k``, the growth factors ``Fkoverf0`` and ``f0``, and the damping moments
+      ``sigma2_w`` (plus ``sigma2_NW`` / ``delta_sigma2_NW`` in ``table_now``).
+
+    Why every loop column is quadratic: each one is a contraction of exactly two fiducial linear
+    spectra -- either a ``P22``-type integral ``int P_L(q) P_L(|k - q|)``, or a ``P13``-type term,
+    which folps stores *pre-multiplied* by ``pk_l`` (``P13overpkl[i] * pk_l`` in
+    ``combine_loop_terms``) so that the stored column is the full ``P13``, also quadratic.  The
+    bias columns multiply such a contraction by one bias factor, which carries no ``P_L``, and the
+    ``A_full`` columns are the b2/bs2 pieces of the same kernels.  Rescaling the linear spectrum
+    at the external wavenumber therefore multiplies each of them by exactly :math:`S(k)^2` --
+    BRASS scales its 1-loop sum by ``sigma8_scaling^2`` (``integrals_rsd.c`` L100) and its TNS
+    ``A``/``B`` kernels likewise (L618 onwards), never by a bias-dependent power.
+
+    Two groups are deliberately left alone.  ``Fkoverf0`` and ``f0`` are growth factors, not
+    powers of :math:`P_L`.  ``sigma2_w`` (and the no-wiggle moments) are single numbers integrated
+    over the whole linear spectrum rather than loop integrands; BRASS keeps its FoG damping as a
+    free parameter instead of deriving it from the tilted input, so they stay at fiducial.  The
+    same treatment is applied to ``table_now`` so that folps' IR resummation uses one linear
+    spectrum consistently.
+
+    Where the factor is applied: ``tilt`` is sampled on the table's own k grid, i.e. at the
+    wavenumbers folps integrated over, and the product is handed to folps, which interpolates the
+    columns onto ``(kap, muap)`` afterwards.  Applying the factor in the integrand instead would
+    put :math:`S` at the internal momenta and is *not* the BRASS approximation.  Note that
+    Kaiser/TNS can apply it after the interpolation, because their tables are already built on
+    ``(kap, muap)``; here it lands one step earlier, which differs only at second order in the
+    grid spacing (``S`` multiplies a smooth column).  A caveat inherited from the approximation:
+    BRASS's 2L-RPT also feeds the tilted spectra into its ``N2(...)`` resummation
+    (``integrals_rsd.c`` L106), while here the tilt multiplies the finished loop columns and the
+    resummation moments stay fiducial -- this hook is the diagram-level (SPT-like) treatment.
+
+    The returned tuple keeps folps' element order, lengths and shapes.
     """
     extra = 6 if A_full else 0
     table = list(table)
@@ -560,8 +657,11 @@ class KaiserPTSpectrum2Poles(Calculator):
     AP distortion, optional Gaussian FoG damping, and GL projection to multipoles.
     Exposes ``table`` with keys ``pk_dd``, ``pk_dt``, ``pk_tt`` (and ``pk11 = pk_dd``).
 
-    Every term is linear in the template power spectrum, so this calculator supports
-    :class:`ShapeFitFastSpectrum2Template` by tilting ``pkt`` once (``supports_fast_shapefit``).
+    Every term is linear in the template power spectrum -- ``pk_dd`` carries one factor of it,
+    and ``pk_dt`` / ``pk_tt`` only add powers of ``f mu^2`` -- so all of them take a single power
+    of the ShapeFit tilt.  This calculator therefore supports
+    :class:`ShapeFitFastSpectrum2Template` by multiplying ``pkt`` once (``supports_fast_shapefit``),
+    matching BRASS's tree-level branch, ``sigma8_scaling * P_lin`` (``integrals_rsd.c`` L98).
 
     Parameters
     ----------
@@ -790,9 +890,13 @@ class TNSPTSpectrum2Poles(Calculator):
     Implements the model of Taruya, Nishimichi & Saito 2010 (arXiv:0912.0244).
     TNS loop kernels are precomputed at build time (``__post_init__``).
 
-    The per-term table keeps the linear and 1-loop contributions separate, so this calculator
-    supports :class:`ShapeFitFastSpectrum2Template` by tilting each term with the power of the
-    linear spectrum it contains (``supports_fast_shapefit``).
+    The per-term table keeps the linear and 1-loop contributions in separate rows (``pk11`` is
+    its own row, and ``pk_dd`` / ``pk_dt`` / ``pk_tt`` are split into a linear and a loop part
+    before tilting), so this calculator supports :class:`ShapeFitFastSpectrum2Template` by tilting
+    each row with the number of linear-power factors it carries (``supports_fast_shapefit``):
+    one power for ``pk11``, two for every 1-loop and bias row and for the 5 + 12 components of the
+    ``A`` / ``B`` kernels.  See :func:`_tns_apply_fast_tilt` for the full row-by-row table and the
+    corresponding BRASS lines.
 
     Parameters
     ----------
@@ -2016,10 +2120,14 @@ class FOLPSPTSpectrum2Poles(Calculator):
     Exposes ``kap``, ``muap``, ``jac``, ``table``, ``table_now``,
     ``f``, ``f0``, ``qpar``, ``qper``, ``sigma8``, ``fsigma8``.
 
-    Supports :class:`ShapeFitFastSpectrum2Template`: folps keeps one column per diagram, so the
-    linear input column is tilted with one power of :math:`S(k)` and every loop column with two,
-    at the wavenumbers of the loop table.  The trailing ``sigma2_w`` damping scale is left at its
-    fiducial value (it is a moment of the whole linear spectrum, not a loop integrand).
+    Supports :class:`ShapeFitFastSpectrum2Template`: folps keeps one column per diagram, which is
+    the decomposition the BRASS approximation needs.  The linear input column (``pk_l``) is tilted
+    with one power of :math:`S(k)` and every loop column with two, because each loop column is a
+    contraction of two fiducial linear spectra -- including the ``P13`` terms, which folps stores
+    pre-multiplied by ``pk_l`` and are therefore quadratic as well.  The growth columns and the
+    trailing ``sigma2_w`` damping scale are left at fiducial: they are not loop integrands (in
+    BRASS the FoG damping is a free parameter, not a moment of the tilted input).  See
+    :func:`_folps_apply_fast_tilt` for the per-column table and the corresponding BRASS lines.
 
     Parameters
     ----------
