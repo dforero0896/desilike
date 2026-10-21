@@ -722,8 +722,11 @@ class ShapeFitFastSpectrum2Template(ShapeFitSpectrum2Template):
     -----
     ``pk_dd`` / ``pknow_dd`` hold the fiducial (untilted) spectra, while ``sigma8`` and
     ``fsigma8`` are computed from the tilted spectrum, as BRASS does with its
-    ``sigma8_scaling``.  The tilt itself is stored in ``tilt`` (on ``self.k``), which is part of
-    the pytree state so it is traced correctly.
+    ``sigma8_scaling``.  The tilt itself is available at any wavenumber from
+    :meth:`get_tilt`, evaluated analytically from ``dm``, ``dn`` and ``dA`` -- no interpolation
+    and no restriction to ``self.k``, so PT calculators may sample it on their own loop grid
+    (FOLPS integrates on a fixed grid that extends well beyond the fit range).  The value on
+    ``self.k`` is also kept in ``tilt`` for inspection.
 
     Only PT calculators that expose a per-term table and declare ``supports_fast_shapefit`` are
     supported.  The others raise ``NotImplementedError`` from their constructors, because their
@@ -737,11 +740,6 @@ class ShapeFitFastSpectrum2Template(ShapeFitSpectrum2Template):
 
     #: Marker read by the PT calculators that implement the per-term tilt hook.
     is_fast_shapefit = True
-
-    def __post_init__(self, *args, **kwargs):
-        super().__post_init__(*args, **kwargs)
-        # Identity tilt until the first __call__; keeps tree_flatten well-defined.
-        self.tilt = jnp.ones_like(self.k)
 
     def __call__(self):
         dm = self.dm.value
@@ -771,24 +769,19 @@ class ShapeFitFastSpectrum2Template(ShapeFitSpectrum2Template):
         return self.pk_dd
 
     def get_tilt(self, k):
-        """Tilt factor :math:`S(k)` (including ``dA``) interpolated at wavenumbers ``k``.
+        r"""ShapeFit factor :math:`S(k) = d_A \exp[\Delta m/a \tanh(a \ln k/k_p) + \Delta n \ln k/k_p]`.
 
-        Log-log interpolation on the template grid: the factor is positive definite and smooth,
-        and the grid is log-spaced.  ``k`` is normally the AP-distorted ``kap`` returned by
-        :meth:`ap_k_mu`, which is exactly where BRASS evaluates its shape factor.
+        Evaluated analytically from the parameters, so it is valid for any wavenumber -- in
+        particular on a PT calculator's own loop grid, which may extend beyond ``self.k``.
+        ``k`` is normally the AP-distorted ``kap``, which is exactly where BRASS evaluates its
+        shape factor; a PT that integrates on a fixed grid (FOLPS) instead samples it on that
+        grid, i.e. at the wavenumbers where its loop integrals live.
         """
-        log_tilt = jnp.log(jnp.maximum(self.tilt, 1e-300))
-        return jnp.exp(jnp.interp(jnp.log(k), jnp.log(self.k), log_tilt))
-
-    def tree_flatten(self):
-        children, aux = super().tree_flatten()
-        return children + [self.tilt], aux
-
-    @classmethod
-    def tree_unflatten(cls, aux, children):
-        obj = super().tree_unflatten(aux, children[:-1])
-        obj.tilt = children[-1]
-        return obj
+        dm = self.dm.value
+        dn = self.dn.value
+        dA = self.dA.value
+        return dA * jnp.exp(dm / self._a * jnp.tanh(self._a * jnp.log(k / self._kp))
+                            + dn * jnp.log(k / self._kp))
 
 
 class DirectSpectrum2Template(Spectrum2Template):

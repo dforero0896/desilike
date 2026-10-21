@@ -492,13 +492,18 @@ def _raise_if_fast_shapefit_unsupported(template, pt_name):
             f"{pt_name} does not implement the per-term ShapeFit tilt hook required by "
             "ShapeFitFastSpectrum2Template: its loop table mixes the linear and loop "
             "contributions, so the tilt cannot be applied to the loop results separately. "
-            "Use KaiserPTSpectrum2Poles or TNSPTSpectrum2Poles instead.")
+            "Use KaiserPTSpectrum2Poles, TNSPTSpectrum2Poles or FOLPSPTSpectrum2Poles instead.")
 
 
-def _fast_shapefit_tilt(template, kap):
-    """The BRASS-like tilt factor at the AP-distorted wavenumbers, or None for a standard template."""
+def _fast_shapefit_tilt(template, k):
+    """The BRASS-like tilt factor at wavenumbers *k*, or None for a standard template.
+
+    *k* is the AP-distorted ``kap`` for the PT calculators that build their table already
+    distorted (Kaiser, TNS), and the loop table's own grid for one that integrates at fixed
+    wavenumbers and distorts afterwards (FOLPS).
+    """
     if getattr(template, 'is_fast_shapefit', False):
-        return template.get_tilt(kap)
+        return template.get_tilt(k)
     return None
 
 
@@ -518,6 +523,32 @@ def _tns_apply_fast_tilt(table, tilt):
     table = table.at[0].multiply(tilt)
     loop_rows = [2, 3, 4, 5, 6, 7, 9, 10] + list(range(12, 29))
     return table.at[jnp.asarray(loop_rows)].multiply(tilt2)
+
+
+def _folps_apply_fast_tilt(table, tilt, A_full):
+    """Apply the BRASS-like tilt to the FOLPS per-diagram loop table, column by column.
+
+    ``table`` is the tuple returned by folps' ``calculate_loop_table``:
+    ``(k, pk_lin, f_k/f_0, <25 loop columns>[, <6 b2/bs2 A-kernel columns], sigma2_w, f_0)``
+    (the no-wiggle table carries two extra scalars before ``f_0``).  ``pk_lin`` is linear in the
+    fiducial linear power and every loop column is quadratic, including the ``P13/pk_lin``
+    pieces, which folps multiplies by ``pk_lin`` before storing them.  ``f_k/f_0`` and ``f_0``
+    are growth factors, and the trailing ``sigma2_w`` (plus the no-wiggle ``sigma2_NW`` /
+    ``delta_sigma2_NW``) are single numbers integrated over the whole linear spectrum rather
+    than loop integrands, so they keep their fiducial values -- as in BRASS, whose FoG damping
+    is a free parameter instead of a moment of the tilted input.
+
+    ``tilt`` is sampled on the table's own k grid, so the factor is applied where the loop
+    integrals were computed -- the BRASS-like operation -- before folps interpolates the table
+    onto ``(kap, muap)``.  The returned tuple keeps folps' element order and shapes.
+    """
+    extra = 6 if A_full else 0
+    table = list(table)
+    tilt2 = tilt**2
+    table[1] = table[1] * tilt
+    for column in range(3, 28 + extra):
+        table[column] = table[column] * tilt2
+    return tuple(table)
 
 
 # ── Kaiser model ──────────────────────────────────────────────────────────────
@@ -1985,6 +2016,11 @@ class FOLPSPTSpectrum2Poles(Calculator):
     Exposes ``kap``, ``muap``, ``jac``, ``table``, ``table_now``,
     ``f``, ``f0``, ``qpar``, ``qper``, ``sigma8``, ``fsigma8``.
 
+    Supports :class:`ShapeFitFastSpectrum2Template`: folps keeps one column per diagram, so the
+    linear input column is tilted with one power of :math:`S(k)` and every loop column with two,
+    at the wavenumbers of the loop table.  The trailing ``sigma2_w`` damping scale is left at its
+    fiducial value (it is a moment of the whole linear spectrum, not a loop integrand).
+
     Parameters
     ----------
     k : array, default=None
@@ -2030,6 +2066,9 @@ class FOLPSPTSpectrum2Poles(Calculator):
     def install(cls, installer):
         installer.pip('git+https://github.com/cosmodesi/FolpsD')
 
+    #: One table column per diagram: the linear column and the loop columns are tilted separately.
+    supports_fast_shapefit = True
+
     def __init__(self, k=None, template=None, ells=(0, 2, 4), mu=6, kernels='fk', rbao=104., A_full=True, remove_DeltaP=False, **kwargs):
         # Nodes (Calculator deps) and their update() live in __init__.
         if k is None:
@@ -2039,7 +2078,6 @@ class FOLPSPTSpectrum2Poles(Calculator):
         if template is None:
             template = DirectSpectrum2Template()
         self.template = template
-        _raise_if_fast_shapefit_unsupported(template, 'FOLPSPTSpectrum2Poles')
         self.template.update(with_now='peakaverage')
         # Share the cosmology's h Parameter with this node: the exact-scaling emulated classes
         # precondition their children in h, and `_anchors` needs this node's value rather than
@@ -2084,6 +2122,12 @@ class FOLPSPTSpectrum2Poles(Calculator):
         table, table_now = folps_nlps.calculate_loop_table(
             k=self.template.k, pklin=self.template.pk_dd,
             pknow=self.template.pknow_dd, **cosmo_params)
+        tilt = _fast_shapefit_tilt(self.template, table[0])
+        if tilt is not None:
+            # BRASS-like: tilt the per-diagram loop results, evaluated on the loop table's own
+            # k grid, rather than the linear power that enters the loop integrals.
+            table = _folps_apply_fast_tilt(table, tilt, self._A_full)
+            table_now = _folps_apply_fast_tilt(table_now, tilt, self._A_full)
         jac, kap, muap = self.template.ap_k_mu(self.k[:, None], self._to_poles.mu)
         self.kap = kap
         self.muap = muap
@@ -2327,6 +2371,9 @@ class FOLPSPTSpectrum3Poles(FOLPSPTSpectrum2Poles):
     Note the loop table is not merely unemulated but *not computed*, so this is also faster than
     :class:`FOLPSPTSpectrum2Poles` on the un-emulated path.
     """
+
+    #: The inherited marker does not apply: the bispectrum kernels are not tilted term by term.
+    supports_fast_shapefit = False
 
     def __init__(self, k=None, template=None, ells=None, mu=6, kernels='fk', rbao=104.,
                  A_full=True, remove_DeltaP=False, **kwargs):

@@ -427,17 +427,63 @@ class TestShapeFitFastTemplate:
             expected[row] = tilt**2 * table[row]
         assert np.allclose(tilted, expected)
 
-    def test_supported_pt_marker(self):
-        """Only the PT calculators with the per-term hook declare support."""
+    def test_folps_tilt_powers(self):
+        """FOLPS keeps one column per diagram: the linear column takes one power of the tilt,
+        every loop column two, while the growth factor and the sigma2_w damping scale keep their
+        fiducial values."""
+        import jax.numpy as jnp
+        from desilike.theories.galaxy_clustering.full_shape import _folps_apply_fast_tilt
+        nk = 5
+        tilt = np.linspace(0.9, 1.1, nk)
+        for A_full, extra in [(False, 0), (True, 6)]:
+            ncolumns = 28 + extra + 2
+            table = tuple(np.full(nk, float(column + 1.)) for column in range(ncolumns))
+            tilted = [np.asarray(column) for column in _folps_apply_fast_tilt(table, jnp.asarray(tilt), A_full)]
+            assert np.allclose(tilted[1], tilt * table[1])
+            for column in range(3, 28 + extra):
+                assert np.allclose(tilted[column], tilt**2 * table[column]), column
+            for column in (0, 2, 28 + extra, 28 + extra + 1):
+                assert np.allclose(tilted[column], table[column]), column
+
+    def test_folps_spectrum(self):
+        """End to end: with FOLPS the fast template agrees exactly with the standard one at zero
+        tilt and differs by a %-level amount at 1-loop once the tilt is on."""
+        pytest.importorskip('folps')
         from desilike.theories.galaxy_clustering import (
-            KaiserPTSpectrum2Poles, TNSPTSpectrum2Poles, FOLPSPTSpectrum2Poles,
+            FOLPSPTSpectrum2Poles, FOLPSTracerSpectrum2Poles,
+            ShapeFitSpectrum2Template, ShapeFitFastSpectrum2Template,
+        )
+        k = np.linspace(0.02, 0.25, 15)
+
+        def poles(template_cls, **overrides):
+            template = template_cls(z=0.5, fiducial=self.FIDUCIAL)
+            pt = FOLPSPTSpectrum2Poles(k=k, template=template, nk=240)
+            theory = FOLPSTracerSpectrum2Poles(k=k, pt=pt, template=template, nbar=5e-4)
+            run = _compile(theory)
+            run(**overrides)
+            return np.asarray(theory.poles)
+
+        assert np.allclose(poles(ShapeFitSpectrum2Template, dm=0., dn=0.),
+                           poles(ShapeFitFastSpectrum2Template, dm=0., dn=0.), rtol=1e-12, atol=0.)
+        standard = poles(ShapeFitSpectrum2Template, dm=0.05, dn=0.03)
+        fast = poles(ShapeFitFastSpectrum2Template, dm=0.05, dn=0.03)
+        assert not np.allclose(standard, fast, rtol=1e-3, atol=0.)
+        difference = np.abs(fast / standard - 1.)
+        assert 1e-3 < difference.max() < 0.2
+
+    def test_supported_pt_marker(self):
+        """Only the PT calculators with the per-term hook declare support; the FOLPS bispectrum
+        class inherits from the power-spectrum one but does not support the tilt."""
+        from desilike.theories.galaxy_clustering import (
+            KaiserPTSpectrum2Poles, TNSPTSpectrum2Poles, FOLPSPTSpectrum2Poles, FOLPSPTSpectrum3Poles,
         )
         assert KaiserPTSpectrum2Poles.supports_fast_shapefit
         assert TNSPTSpectrum2Poles.supports_fast_shapefit
-        assert not getattr(FOLPSPTSpectrum2Poles, 'supports_fast_shapefit', False)
+        assert FOLPSPTSpectrum2Poles.supports_fast_shapefit
+        assert not FOLPSPTSpectrum3Poles.supports_fast_shapefit
 
     def test_jit_traces_tilt(self):
-        """The tilt is a pytree leaf, so a compiled graph still responds to dm/dn."""
+        """The tilt is recomputed from the parameters, so a compiled graph still responds to dm/dn."""
         from desilike.theories.galaxy_clustering import (
             KaiserPTSpectrum2Poles, KaiserTracerSpectrum2Poles, ShapeFitFastSpectrum2Template,
         )
@@ -452,12 +498,13 @@ class TestShapeFitFastTemplate:
         assert not np.allclose(eager, run(dm=0., dn=0., b1=2.), rtol=1e-4)
 
     def test_unsupported_pt_raises(self):
-        """PT calculators whose loop table mixes linear and loop contributions refuse the fast
-        template instead of silently applying the tilt in the wrong place."""
+        """PT calculators whose table cannot be tilted term by term (the FOLPS bispectrum
+        kernels, which reuse the power-spectrum class) refuse the fast template instead of
+        silently applying the tilt in the wrong place."""
         pytest.importorskip('folps')
-        from desilike.theories.galaxy_clustering import FOLPSPTSpectrum2Poles, ShapeFitFastSpectrum2Template
+        from desilike.theories.galaxy_clustering import FOLPSPTSpectrum3Poles, ShapeFitFastSpectrum2Template
         with pytest.raises(NotImplementedError, match='per-term ShapeFit tilt'):
-            FOLPSPTSpectrum2Poles(k=np.linspace(0.02, 0.3, 10),
+            FOLPSPTSpectrum3Poles(k=np.linspace(0.02, 0.3, 10),
                                   template=ShapeFitFastSpectrum2Template(z=0.5, fiducial=self.FIDUCIAL))
 
 
