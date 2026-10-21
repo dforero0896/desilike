@@ -478,6 +478,48 @@ def tns_pt(k, q, wq, pk_q, kernel13_d, kernel13_t, kernel_a):
     return [pk_k, pk_dd, pk_b2d, pk_bs2d, pk_sig3sq, pk_b22, pk_b2s2, pk_bs22, pk_dt, pk_b2t, pk_bs2t, pk_tt, A, B]
 
 
+# ── ShapeFit tilt hooks ───────────────────────────────────────────────────────
+
+def _raise_if_fast_shapefit_unsupported(template, pt_name):
+    """Refuse the BRASS-like template in PT calculators without the per-term tilt hook.
+
+    Only the calculators that keep their linear and loop contributions in separate table
+    entries can apply the ShapeFit tilt to the loop results afterwards.  The others would
+    silently ignore the tilt, so they fail here instead.
+    """
+    if getattr(template, 'is_fast_shapefit', False):
+        raise NotImplementedError(
+            f"{pt_name} does not implement the per-term ShapeFit tilt hook required by "
+            "ShapeFitFastSpectrum2Template: its loop table mixes the linear and loop "
+            "contributions, so the tilt cannot be applied to the loop results separately. "
+            "Use KaiserPTSpectrum2Poles or TNSPTSpectrum2Poles instead.")
+
+
+def _fast_shapefit_tilt(template, kap):
+    """The BRASS-like tilt factor at the AP-distorted wavenumbers, or None for a standard template."""
+    if getattr(template, 'is_fast_shapefit', False):
+        return template.get_tilt(kap)
+    return None
+
+
+def _tns_apply_fast_tilt(table, tilt):
+    """Apply the BRASS-like tilt to the per-term TNS table, term by term.
+
+    ``table`` has shape ``(29, n_k, n_mu)`` and, in order, holds pk11, pk_dd, the six 1-loop
+    bias terms, pk_dt and its two bias partners, pk_tt, and then the 5 + 12 components of the
+    TNS ``A`` and ``B`` kernels.  ``pk11`` is a separate row, so the linear part of ``pk_dd`` /
+    ``pk_dt`` / ``pk_tt`` is tilted with one power and their 1-loop remainder with two; every
+    bias term and every ``A``/``B`` component carries two factors of the linear power.
+    """
+    tilt2 = tilt**2
+    linear = table[0]
+    for row in (1, 8, 11):  # pk_dd, pk_dt, pk_tt = pk11 + 1-loop
+        table = table.at[row].set(tilt * linear + tilt2 * (table[row] - linear))
+    table = table.at[0].multiply(tilt)
+    loop_rows = [2, 3, 4, 5, 6, 7, 9, 10] + list(range(12, 29))
+    return table.at[jnp.asarray(loop_rows)].multiply(tilt2)
+
+
 # ── Kaiser model ──────────────────────────────────────────────────────────────
 
 class KaiserPTSpectrum2Poles(Calculator):
@@ -486,6 +528,9 @@ class KaiserPTSpectrum2Poles(Calculator):
 
     AP distortion, optional Gaussian FoG damping, and GL projection to multipoles.
     Exposes ``table`` with keys ``pk_dd``, ``pk_dt``, ``pk_tt`` (and ``pk11 = pk_dd``).
+
+    Every term is linear in the template power spectrum, so this calculator supports
+    :class:`ShapeFitFastSpectrum2Template` by tilting ``pkt`` once (``supports_fast_shapefit``).
 
     Parameters
     ----------
@@ -498,6 +543,9 @@ class KaiserPTSpectrum2Poles(Calculator):
     mu : int, default=8
         Number of Gauss-Legendre mu-bins in [0, 1].
     """
+
+    #: Supports ShapeFitFastSpectrum2Template: all terms are linear in the template spectrum.
+    supports_fast_shapefit = True
 
     def __init__(self, k=None, template=None, ells=(0, 2, 4), mu=8, **kwargs):
         # Nodes (Parameters + Calculator deps) and their update() live in __init__.
@@ -527,6 +575,11 @@ class KaiserPTSpectrum2Poles(Calculator):
         sigmanl2 = kap**2 * (self.sigmapar**2 * muap**2 + self.sigmaper**2 * (1. - muap**2))
         damping = jnp.exp(-sigmanl2 / 2.)
         pkt = jac * damping * _interp_loglog(kap, self.template.k, self.template.pk_dd)
+        tilt = _fast_shapefit_tilt(self.template, kap)
+        if tilt is not None:
+            # BRASS-like: the template handed us the untilted linear power, and every
+            # tree-level term carries exactly one factor of it.
+            pkt = pkt * tilt
         self.table = {
             'pk_dd': self._to_poles(pkt),
             'pk_dt': self._to_poles(f * muap**2 * pkt),
@@ -706,6 +759,10 @@ class TNSPTSpectrum2Poles(Calculator):
     Implements the model of Taruya, Nishimichi & Saito 2010 (arXiv:0912.0244).
     TNS loop kernels are precomputed at build time (``__post_init__``).
 
+    The per-term table keeps the linear and 1-loop contributions separate, so this calculator
+    supports :class:`ShapeFitFastSpectrum2Template` by tilting each term with the power of the
+    linear spectrum it contains (``supports_fast_shapefit``).
+
     Parameters
     ----------
     k : array, default=None
@@ -719,6 +776,9 @@ class TNSPTSpectrum2Poles(Calculator):
     fog : str, default='lorentzian'
         Finger-of-God damping kernel: 'lorentzian' or 'gaussian'.
     """
+
+    #: Supports ShapeFitFastSpectrum2Template: linear and 1-loop terms are separate rows.
+    supports_fast_shapefit = True
 
     @classmethod
     def propose_params(cls, tracers=None):
@@ -773,6 +833,10 @@ class TNSPTSpectrum2Poles(Calculator):
         table_interp = interpax.interp1d(kap_flat, jnp.log10(self._k11), table.T, method='cubic', extrap=True)
         table = jac * damping * jnp.moveaxis(jnp.reshape(table_interp, kap.shape + (29,)), [0, 1], [1, 2])
         # table shape: (29, n_k, n_mu)
+        tilt = _fast_shapefit_tilt(self.template, kap)
+        if tilt is not None:
+            # BRASS-like: tilt the per-term loop table (after the AP distortion, before projection).
+            table = _tns_apply_fast_tilt(table, tilt)
 
         A_raw = table[12:17]   # (5, n_k, n_mu)
         B_raw = table[17:]     # (12, n_k, n_mu)
@@ -996,6 +1060,7 @@ class LPTVelocileptorsPTSpectrum2Poles(Calculator):
         if template is None:
             template = DirectSpectrum2Template()
         self.template = template
+        _raise_if_fast_shapefit_unsupported(template, 'LPTVelocileptorsPTSpectrum2Poles')
         self.template.update(k=np.geomspace(min(1e-4, self.k[0] / 2.), max(2., self.k[-1] * 2.), 500))
 
     def __post_init__(self, k=None, template=None, ells=(0, 2, 4), mu=4, **kwargs):
@@ -1214,6 +1279,7 @@ class REPTVelocileptorsPTSpectrum2Poles(Calculator):
         if template is None:
             template = DirectSpectrum2Template()
         self.template = template
+        _raise_if_fast_shapefit_unsupported(template, 'REPTVelocileptorsPTSpectrum2Poles')
         self.template.update(with_now='peakaverage')
         self.template.update(k=np.geomspace(min(1e-4, self.k[0] / 2.), max(2., self.k[-1] * 2.), 500))
 
@@ -1430,6 +1496,7 @@ class PyBirdPTSpectrum2Poles(Calculator):
         if template is None:
             template = DirectSpectrum2Template()
         self.template = template
+        _raise_if_fast_shapefit_unsupported(template, 'PyBirdPTSpectrum2Poles')
         if with_nnlo_counterterm:
             self.template.update(with_now='peakaverage')
 
@@ -1733,6 +1800,7 @@ class PyBirdPTCorrelation2Poles(Calculator):
         if template is None:
             template = DirectSpectrum2Template()
         self.template = template
+        _raise_if_fast_shapefit_unsupported(template, 'PyBirdPTCorrelation2Poles')
         if with_nnlo_counterterm:
             self.template.update(with_now='peakaverage')
 
@@ -1971,6 +2039,7 @@ class FOLPSPTSpectrum2Poles(Calculator):
         if template is None:
             template = DirectSpectrum2Template()
         self.template = template
+        _raise_if_fast_shapefit_unsupported(template, 'FOLPSPTSpectrum2Poles')
         self.template.update(with_now='peakaverage')
         # Share the cosmology's h Parameter with this node: the exact-scaling emulated classes
         # precondition their children in h, and `_anchors` needs this node's value rather than
@@ -2273,6 +2342,7 @@ class FOLPSPTSpectrum3Poles(FOLPSPTSpectrum2Poles):
         if template is None:
             template = DirectSpectrum2Template()
         self.template = template
+        _raise_if_fast_shapefit_unsupported(template, 'FOLPSPTSpectrum3Poles')
         self.template.update(with_now='peakaverage')
         # As on the parent: share the cosmology's h Parameter with this node, so `_anchors` reads
         # the value the graph threads here rather than the template's own copy.  Needed since
@@ -3156,6 +3226,7 @@ class FKPTJAXPTSpectrum2Poles(Calculator):
         if template is None:
             template = DirectSpectrum2Template()
         self.template = template
+        _raise_if_fast_shapefit_unsupported(template, 'FKPTJAXPTSpectrum2Poles')
         self.template.update(with_now='peakaverage')
 
         # Fixed at the GR limit (0.) by default, like the other MG parameters below;
@@ -6227,6 +6298,7 @@ class GeoFPTAXPTSpectrum2Poles(Calculator):
         if template is None:
             template = DirectSpectrum2Template()
         self.template = template
+        _raise_if_fast_shapefit_unsupported(template, 'GeoFPTAXPTSpectrum2Poles')
         self.template.update(with_now='peakaverage')
         
         # Ensure template has wide enough k-grid for 1-loop integrals

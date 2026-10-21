@@ -11,6 +11,9 @@ FixedSpectrum2Template
     no free parameters at all (no AP distortion, no growth-rate rescaling).
 ShapeFitSpectrum2Template
     BAO template with ShapeFit tilt parameterisation (dm, dn).
+ShapeFitFastSpectrum2Template
+    BRASS-like variant of the ShapeFit template: the tilt is exposed separately and applied
+    to the PT loop results term by term, instead of multiplying the linear input.
 DirectSpectrum2Template
     Direct template: power spectrum computed at every evaluation from a
     :class:`CosmoprimoCosmology` dependency.
@@ -692,6 +695,99 @@ class ShapeFitSpectrum2Template(Spectrum2Template):
         (obj.pk_dd, obj.pknow_dd, obj.f, obj.f0, obj.fk, obj.qpar, obj.qper,
          obj.sigma8, obj.fsigma8, obj.sigma8_fid) = children
         obj.k = aux['k']
+        return obj
+
+
+class ShapeFitFastSpectrum2Template(ShapeFitSpectrum2Template):
+    r"""
+    BRASS-like ShapeFit template: the tilt is applied to the PT loop results.
+
+    Identical parameters, priors, fiducial cosmology and AP convention to
+    :class:`ShapeFitSpectrum2Template`.  The difference is *where* the ShapeFit factor enters.
+    The standard template multiplies the fiducial linear power before handing it to the PT
+    calculator, so every loop integral is evaluated with the tilted linear power.  This template
+    instead hands the PT the **untilted** fiducial linear power and exposes the tilt factor
+    :math:`S(k)` separately through :meth:`get_tilt`.  PT calculators that know their
+    per-diagram decomposition (e.g. :class:`KaiserPTSpectrum2Poles`,
+    :class:`TNSPTSpectrum2Poles`) then multiply each term by :math:`S(k)^{p}`, where ``p`` is the
+    number of linear-power factors in that term.  This is the approximation used by BRASS: the
+    loop tables are computed once from the fiducial linear spectrum, and the ShapeFit factor is
+    applied to the loop integral results afterwards.
+
+    The AP distortion (``kap``, ``muap``) is evaluated exactly as in the standard template --
+    ``ap_k_mu`` is inherited unchanged.  The tilt is a function of the AP-distorted wavenumber
+    ``kap`` only, so the two templates differ only in the placement of the tilt.
+
+    Notes
+    -----
+    ``pk_dd`` / ``pknow_dd`` hold the fiducial (untilted) spectra, while ``sigma8`` and
+    ``fsigma8`` are computed from the tilted spectrum, as BRASS does with its
+    ``sigma8_scaling``.  The tilt itself is stored in ``tilt`` (on ``self.k``), which is part of
+    the pytree state so it is traced correctly.
+
+    Only PT calculators that expose a per-term table and declare ``supports_fast_shapefit`` are
+    supported.  The others raise ``NotImplementedError`` from their constructors, because their
+    loop tables mix the linear and loop contributions and cannot be tilted term by term.
+
+    See Also
+    --------
+    ShapeFitSpectrum2Template
+        The standard implementation, where the tilt multiplies the linear input.
+    """
+
+    #: Marker read by the PT calculators that implement the per-term tilt hook.
+    is_fast_shapefit = True
+
+    def __post_init__(self, *args, **kwargs):
+        super().__post_init__(*args, **kwargs)
+        # Identity tilt until the first __call__; keeps tree_flatten well-defined.
+        self.tilt = jnp.ones_like(self.k)
+
+    def __call__(self):
+        dm = self.dm.value
+        dn = self.dn.value
+        df = self.df.value
+        dA = self.dA.value
+        sqrt_dA = jnp.sqrt(dA)
+        # Same factor, same grid, same kpivot/a as the standard template.  It is exposed
+        # separately instead of multiplying pk_dd, so the PT sees the fiducial linear power.
+        self.tilt = dA * jnp.exp(dm / self._a * jnp.tanh(self._a * jnp.log(self.k / self._kp))
+                                 + dn * jnp.log(self.k / self._kp))
+        self.pk_dd = self._pk_dd_fid
+        self.pknow_dd = self._pknow_dd_fid
+        if self._only_now:
+            self.pk_dd = self.pknow_dd
+        self.f = self._f_fid * df / sqrt_dA
+        self.f0 = self._f0_fid * df / sqrt_dA
+        self.fk = self._fk_fid * df / sqrt_dA
+        qpar, qper = self._qpar_qper()
+        self.qpar = qpar
+        self.qper = qper
+        pk_tilted = (self.pknow_dd if self._only_now else self._pk_dd_fid) * self.tilt
+        s_tilted = jnp.sum(self._s8_weights * pk_tilted)
+        self.sigma8 = self._sigma8_fid * jnp.sqrt(s_tilted / self._s8_fid_sq)
+        self.fsigma8 = self.f * self.sigma8
+        self.sigma8_fid = jnp.asarray(self._sigma8_fid)
+        return self.pk_dd
+
+    def get_tilt(self, k):
+        """Tilt factor :math:`S(k)` (including ``dA``) interpolated at wavenumbers ``k``.
+
+        Log-log interpolation on the template grid: the factor is positive definite and smooth,
+        and the grid is log-spaced.  ``k`` is normally the AP-distorted ``kap`` returned by
+        :meth:`ap_k_mu`, which is exactly where BRASS evaluates its shape factor.
+        """
+        log_tilt = jnp.log(jnp.maximum(self.tilt, 1e-300))
+        return jnp.exp(jnp.interp(jnp.log(k), jnp.log(self.k), log_tilt))
+
+    def tree_flatten(self):
+        children, aux = super().tree_flatten()
+        return children + [self.tilt], aux
+
+    @classmethod
+    def tree_unflatten(cls, aux, children):
+        obj = super().tree_unflatten(aux, children[:-1])
+        obj.tilt = children[-1]
         return obj
 
 

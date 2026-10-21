@@ -317,6 +317,150 @@ class TestTNSPoles:
         _check_emulator(pipe_exact, _emulate(theory_emu, inner_pt=theory_emu.pt.pt), shift_param='b1')
 
 
+# ── ShapeFit fast (BRASS-like) template ───────────────────────────────────────
+
+class TestShapeFitFastTemplate:
+    """``ShapeFitFastSpectrum2Template``: same parameters and AP convention as
+    ``ShapeFitSpectrum2Template``, but the PT is fed the *untilted* fiducial linear power and the
+    tilt is applied to the per-diagram loop results instead (BRASS's approximation)."""
+
+    # A cheap fiducial engine keeps the suite free of external Boltzmann code dependencies
+    # (the default DESI/AbacusSummit fiducial needs CLASS).
+    FIDUCIAL = ('DESI', {'engine': 'eisenstein_hu'})
+
+    @staticmethod
+    def _poles(pt_cls, template_cls, k, **overrides):
+        theory = pt_cls(k=k, template=template_cls(z=0.5, fiducial=TestShapeFitFastTemplate.FIDUCIAL))
+        run = _compile(theory)
+        run(**overrides)
+        return np.asarray(theory.table['pk_dd']), theory.template
+
+    def test_identity_at_zero_tilt(self):
+        """With dm == dn == 0 the tilt is 1, so the PT input is the same and the two templates
+        must agree exactly."""
+        from desilike.theories.galaxy_clustering import (
+            KaiserPTSpectrum2Poles, TNSPTSpectrum2Poles,
+            ShapeFitSpectrum2Template, ShapeFitFastSpectrum2Template,
+        )
+        k = np.linspace(0.02, 0.3, 30)
+        for pt_cls in [KaiserPTSpectrum2Poles, TNSPTSpectrum2Poles]:
+            standard = self._poles(pt_cls, ShapeFitSpectrum2Template, k, dm=0., dn=0.)[0]
+            fast = self._poles(pt_cls, ShapeFitFastSpectrum2Template, k, dm=0., dn=0.)[0]
+            assert np.allclose(standard, fast, rtol=1e-12, atol=0.), pt_cls.__name__
+
+    def test_untilted_input_and_loop_tilt(self):
+        """The fast template keeps the PT input fixed while the tilt varies, the tree-level
+        Kaiser case is insensitive to where the tilt is applied, and the 1-loop difference is a
+        %-level effect that grows with k."""
+        from desilike.theories.galaxy_clustering import (
+            KaiserPTSpectrum2Poles, TNSPTSpectrum2Poles,
+            ShapeFitSpectrum2Template, ShapeFitFastSpectrum2Template,
+        )
+        k = np.linspace(0.02, 0.3, 30)
+        tilt = dict(dm=0.05, dn=0.03)
+
+        # The PT input does not move with the tilt in the fast template (the loop table is
+        # computed once, from the fiducial linear power), while it does in the standard one.
+        theory = TNSPTSpectrum2Poles(k=k, template=ShapeFitFastSpectrum2Template(z=0.5, fiducial=self.FIDUCIAL))
+        run = _compile(theory)
+        run(dm=0., dn=0.)
+        input_untilted = np.asarray(theory.template.pk_dd)
+        poles_untilted = np.asarray(theory.table['pk_dd'])
+        run(**tilt)
+        assert np.allclose(input_untilted, np.asarray(theory.template.pk_dd), rtol=1e-13, atol=0.)
+        poles_fast_tilted = np.asarray(theory.table['pk_dd'])
+        assert not np.allclose(poles_untilted, poles_fast_tilted, rtol=1e-3, atol=0.)
+
+        standard_theory = TNSPTSpectrum2Poles(k=k, template=ShapeFitSpectrum2Template(z=0.5, fiducial=self.FIDUCIAL))
+        standard_run = _compile(standard_theory)
+        standard_run(dm=0., dn=0.)
+        standard_untilted = np.asarray(standard_theory.template.pk_dd)
+        standard_run(**tilt)
+        assert not np.allclose(standard_untilted, np.asarray(standard_theory.template.pk_dd), rtol=1e-6, atol=0.)
+
+        # At tree level every term carries exactly one factor of the linear power, so the two
+        # prescriptions coincide (up to the interpolation of the tilted input).
+        kaiser_standard = self._poles(KaiserPTSpectrum2Poles, ShapeFitSpectrum2Template, k, **tilt)[0]
+        kaiser_fast = self._poles(KaiserPTSpectrum2Poles, ShapeFitFastSpectrum2Template, k, **tilt)[0]
+        assert np.allclose(kaiser_standard, kaiser_fast, rtol=1e-6,
+                           atol=1e-6 * np.abs(kaiser_standard).max())
+
+        # The BRASS-like approximation is a %-level effect at 1-loop.
+        standard_tilted = self._poles(TNSPTSpectrum2Poles, ShapeFitSpectrum2Template, k, **tilt)[0]
+        assert not np.allclose(poles_fast_tilted, standard_tilted, rtol=1e-3, atol=0.)
+        difference = np.abs(poles_fast_tilted / standard_tilted - 1.)
+        assert 1e-3 < difference.max() < 0.2
+
+    def test_get_tilt(self):
+        """``get_tilt`` exposes the ShapeFit factor the PT applies term by term."""
+        from desilike.theories.galaxy_clustering import TNSPTSpectrum2Poles, ShapeFitFastSpectrum2Template
+        k = np.geomspace(0.02, 0.25, 40)
+        template = ShapeFitFastSpectrum2Template(z=0.5, fiducial=self.FIDUCIAL)
+        theory = TNSPTSpectrum2Poles(k=k, template=template)
+        _compile(theory)(dm=0.05, dn=0.03)
+        kpivot, slope = 0.03, 0.6
+        for k_value in [0.03, 0.1, 0.2]:
+            expected = np.exp(0.05 / slope * np.tanh(slope * np.log(k_value / kpivot))
+                              + 0.03 * np.log(k_value / kpivot))
+            got = float(np.asarray(template.get_tilt(k_value)))
+            assert np.isclose(got, expected, rtol=1e-4), (k_value, got, expected)
+
+    def test_tns_tilt_powers(self):
+        """The TNS per-term tilt follows BRASS's convention: one power of S on the linear row and
+        on the linear part of pk_dd/pk_dt/pk_tt, two powers on every loop and bias term."""
+        import jax.numpy as jnp
+        from desilike.theories.galaxy_clustering.full_shape import _tns_apply_fast_tilt
+        nk, nmu = 4, 3
+        linear = np.linspace(1., 4., nk)[:, None] * np.ones((1, nmu))
+        loop = np.full((nk, nmu), 0.5)
+        tilt = np.linspace(0.9, 1.1, nk)[:, None] * np.ones((1, nmu))
+        table = np.stack([linear + loop] * 29)
+        table[0] = linear
+        for row in (1, 8, 11):
+            table[row] = linear + loop
+        tilted = np.asarray(_tns_apply_fast_tilt(jnp.asarray(table), jnp.asarray(tilt)))
+        expected = table.copy()
+        expected[0] = tilt * linear
+        for row in (1, 8, 11):
+            expected[row] = tilt * linear + tilt**2 * loop
+        for row in [2, 3, 4, 5, 6, 7, 9, 10] + list(range(12, 29)):
+            expected[row] = tilt**2 * table[row]
+        assert np.allclose(tilted, expected)
+
+    def test_supported_pt_marker(self):
+        """Only the PT calculators with the per-term hook declare support."""
+        from desilike.theories.galaxy_clustering import (
+            KaiserPTSpectrum2Poles, TNSPTSpectrum2Poles, FOLPSPTSpectrum2Poles,
+        )
+        assert KaiserPTSpectrum2Poles.supports_fast_shapefit
+        assert TNSPTSpectrum2Poles.supports_fast_shapefit
+        assert not getattr(FOLPSPTSpectrum2Poles, 'supports_fast_shapefit', False)
+
+    def test_jit_traces_tilt(self):
+        """The tilt is a pytree leaf, so a compiled graph still responds to dm/dn."""
+        from desilike.theories.galaxy_clustering import (
+            KaiserPTSpectrum2Poles, KaiserTracerSpectrum2Poles, ShapeFitFastSpectrum2Template,
+        )
+        k = np.linspace(0.02, 0.2, 20)
+        template = ShapeFitFastSpectrum2Template(z=0.5, fiducial=self.FIDUCIAL)
+        theory = KaiserTracerSpectrum2Poles(k=k, pt=KaiserPTSpectrum2Poles(k=k, template=template))
+        run = _compile(theory)
+        eager = run(dm=0.05, dn=0.03, b1=2.)
+        traced = run(_jit=True, dm=0.05, dn=0.03, b1=2.)
+        _check(eager, 'ShapeFitFastSpectrum2Template')
+        assert np.allclose(eager, traced, rtol=1e-10)
+        assert not np.allclose(eager, run(dm=0., dn=0., b1=2.), rtol=1e-4)
+
+    def test_unsupported_pt_raises(self):
+        """PT calculators whose loop table mixes linear and loop contributions refuse the fast
+        template instead of silently applying the tilt in the wrong place."""
+        pytest.importorskip('folps')
+        from desilike.theories.galaxy_clustering import FOLPSPTSpectrum2Poles, ShapeFitFastSpectrum2Template
+        with pytest.raises(NotImplementedError, match='per-term ShapeFit tilt'):
+            FOLPSPTSpectrum2Poles(k=np.linspace(0.02, 0.3, 10),
+                                  template=ShapeFitFastSpectrum2Template(z=0.5, fiducial=self.FIDUCIAL))
+
+
 # ── LPT velocileptors ─────────────────────────────────────────────────────────
 
 class TestLPTVelocileptors:
