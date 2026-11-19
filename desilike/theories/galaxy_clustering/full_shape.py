@@ -6658,6 +6658,86 @@ class FKPTEmulator(FOLPSDEmulator):
         return layout
 
 
+class GeoFPTAXEmulator(_ScaledEmulator):
+    r"""The GeoFPTAX pt: one-loop real-space ``P(k)`` plus exact scalars.
+
+    Same routing as :class:`FOLPSDEmulator` -- expand the shape parameters only, carry
+    ``(w0_fld, wa_fld, logA)`` exactly through the background scalars -- but simpler,
+    because the pt emits a single 1D array (``pk_1loop``) rather than a 2D table plus a
+    distorted AP grid.
+
+    Three things route, all through mechanisms already in :class:`_ScaledEmulator`:
+
+    - ``pk_1loop`` scales exactly as :math:`\sigma_8^2` and dilates as :math:`s^3`: divided
+      out at fit time (with a cubic resample back to the reference frame), multiplied back
+      at prediction.
+    - ``f, qpar, qper, sigma8, fsigma8`` come from the run-time scalar provider.
+    - ``sigma8_fid`` and ``h_anchor, sigma_mpc_anchor`` are latched or read from scalars.
+
+    No ``emulator_namespace`` override: :class:`GeoFPTAXTracerSpectrum3Poles.__call__`
+    reads only ``pt.pk_1loop, pt.k, pt.f, pt.qpar, pt.qper, pt.sigma8, pt.sigma8_fid,
+    pt.z`` -- no live ``template``, no bias-combination over ``pt`` attributes -- so the
+    deployed emulator presents the same interface the exact pt does.
+    """
+    precondition = ('h',)
+
+    def set_children_leafnames(self):
+        self.children_leafnames = [
+            'pk_1loop', 'f', 'qpar', 'qper', 'sigma8', 'fsigma8', 'sigma8_fid',
+            'z', 'h_anchor', 'sigma_mpc_anchor']
+
+    def transform(self, values, params):
+        """Resample ``pk_1loop`` to the reference frame and divide out its amplitude.
+
+        Two things happen at once, as in :class:`FOLPSDEmulator`:
+
+        - the array is resampled at ``k / s`` back to what it would be at ``h_fid`` (i.e.
+          BAO wiggles at fixed *physical* scale, so they stop sliding through the grid),
+        - divided by ``amplitude * s^3``, so what remains is smooth in ``h`` and expands in
+          a handful of nodes.
+
+        The scalars (``f, qpar, qper, sigma8, fsigma8``) do not appear in the fit: they are
+        reconstructed exactly in :meth:`inverse_transform` from the run-time provider.
+        ``z`` is a constant across the parameter space and rides through unchanged.
+        """
+        out = {name: value for name, value in values.items()
+               if name.startswith(DERIVED)}
+        scale = values['h_anchor'] / self._h_fid
+        amplitude = (values['sigma_mpc_anchor'] / values['sigma8_fid'])**2
+        k = self.calculator.k
+        out['pk_1loop'] = (
+            _resample_dilated(k, values['pk_1loop'], k / scale)
+            / (amplitude * scale**3))
+        out['z'] = values['z']
+        return out
+
+    def inverse_transform(self, values, params):
+        """Restore the amplitude and dilation on ``pk_1loop``, provide every scalar exactly."""
+        scalars = self.compute_scalars(params)
+        scale = scalars['h'] / self._h_fid
+        amplitude = (scalars['sigma_mpc'] / self._sigma8_fid)**2
+        k = self.calculator.k
+        out = {name: value for name, value in values.items()
+               if name.startswith(DERIVED)}
+        out['pk_1loop'] = (
+            _resample_dilated(k, values['pk_1loop'], k * scale)
+            * (amplitude * scale**3))
+        out.update({
+            'f':             scalars['f'],
+            'qpar':          scalars['qpar'],
+            'qper':          scalars['qper'],
+            'sigma8':        scalars['sigma8'],
+            'fsigma8':       scalars['fsigma8'],
+            'sigma8_fid':    self._sigma8_fid,
+            'z':             values['z'],
+            'h_anchor':      scalars['h'],
+            'sigma_mpc_anchor': scalars['sigma_mpc'],
+        })
+        out.update({name: value for name, value in scalars.items()
+                    if name.startswith(DERIVED)})
+        return out
+
+
 class GeoFPTAXPTSpectrum2Poles(Calculator):
     r"""
     GeoFPTAX 1-loop real-space matter power spectrum.
@@ -6701,7 +6781,11 @@ class GeoFPTAXPTSpectrum2Poles(Calculator):
             template = DirectSpectrum2Template()
         self.template = template
         self.template.update(with_now='peakaverage')
-        
+        # Share the cosmology's `h` Parameter with this node: the exact-scaling emulated
+        # class preconditions its children in `h`, and `_anchors` needs this node's value
+        # rather than the template's own copy -- sharing makes the graph thread it here.
+        cosmo_params = self.template.cosmo.params if hasattr(self.template, 'cosmo') else {}
+        self.params = {name: cosmo_params[name] for name in ('h',) if name in cosmo_params}
         # Ensure template has wide enough k-grid for 1-loop integrals
         k_min = min(1e-4, self.k[0] / 2.)
         k_max = max(1., self.k[-1] * 2.)
@@ -6719,7 +6803,26 @@ class GeoFPTAXPTSpectrum2Poles(Calculator):
         
         # Compute the static 1-loop kernel
         self._kernel13_d = pt_kernel(self.k, self._q, self._wq)
-    
+    def _anchors(self):
+        """(h, sigma_mpc) at this node, for an emulator that preconditions in h.
+
+        Outputs, not attributes to be read back later: under jit the graph evaluates a
+        copy of this calculator, so anything read off the original afterwards is the
+        previous node's value. Travelling out through `tree_flatten` puts them on the same
+        path as every other child, which is traced per node.
+
+        `sigma_mpc` is `sigma8` moved to a fixed Mpc radius: the 8 Mpc/h window itself
+        moves with h, and an emulator dividing out the amplitude needs this one rather than
+        `sigma8`, or it is left with `(sigma8 / sigma_mpc)^2d` -- a k-independent residual
+        that looks like a dilation failure and is not.
+        """
+        from ..primordial_cosmology import _sigma_tophat
+        h_fid = self.template._fiducial.h
+        h = self.params['h'].value if 'h' in self.params else h_fid
+        scale = h / h_fid
+        ratio = (_sigma_tophat(self.template.k, self.template.pk_dd, 8. * scale)
+                 / _sigma_tophat(self.template.k, self.template.pk_dd, 8.))
+        return h, self.sigma8 * ratio
     def __call__(self):
         from geofptax.kernels import pt_pk_1loop
         
@@ -6739,26 +6842,39 @@ class GeoFPTAXPTSpectrum2Poles(Calculator):
         # 2. Compute 1-loop real-space matter power spectrum
         pk11, pk22, pk13 = pt_pk_1loop(self.k, self._q, self._wq, pk_q, self._kernel13_d)
         self.pk_1loop = pk11 + pk22 + pk13
+        self.h_anchor, self.sigma_mpc_anchor = self._anchors()
+
         
         return self.pk_1loop
     
     def tree_flatten(self):
-        children = [self.pk_1loop, self.f, self.qpar, self.qper, 
+        children = [self.pk_1loop, self.f, self.qpar, self.qper,
                     self.sigma8, self.fsigma8, self.sigma8_fid,
-                    self.z]
+                    self.z, self.h_anchor, self.sigma_mpc_anchor]
         aux = {'k': self.k}
         return children, aux
-    
+
     @classmethod
     def tree_unflatten(cls, aux, children):
         obj = object.__new__(cls)
-        (obj.pk_1loop, obj.f, obj.qpar, obj.qper, 
+        (obj.pk_1loop, obj.f, obj.qpar, obj.qper,
          obj.sigma8, obj.fsigma8, obj.sigma8_fid,
-         obj.z) = children
+         obj.z, obj.h_anchor, obj.sigma_mpc_anchor) = children
         obj.k = aux['k']
         return obj
 
+    def get_emulator_cls(self):
+        """The exact-scaling emulator for this pt.
 
+        Routes (w0_fld, wa_fld, logA) exactly through the background scalars, leaving only
+        (h, omega_b, omega_cdm, n_s) on the grid. Same construction as
+        :class:`FOLPSDEmulator` -- the pt emits a real-space 1-loop on a fixed k-grid, and
+        the h-preconditioning resamples it back to a reference frame at fit time so that
+        BAO wiggles do not slide through the grid.
+        """
+        return CalculatorEmulator
+
+GeoFPTAXEmulator = CalculatorEmulator
 class GeoFPTAXTracerSpectrum3Poles(Calculator):
     r"""
     GeoFPTAX tracer bispectrum multipoles in the Sugiyama basis.

@@ -100,13 +100,20 @@ def _emulate(theory, inner_pt=None, max_axes=_EMU_MAX_AXES):
 
 
 def _check(pipe_exact, pipe_emu, shift_param, reldiff_tol=0.10):
-    """Center-exact match (atol=1e-8) and shifted accuracy (relative < tol)."""
-    center = {p.name: p.value for p in pipe_exact.params}
-    # Each pipeline gets the parameters it actually has. A parameter the emulator's space left
-    # out is frozen at its trained value, so the emulated pipeline exposes fewer than the exact
-    # one -- and it refuses a name it does not have rather than silently ignoring it.
-    emu_names = set(pipe_emu.params.names())
-    assert emu_names <= set(center), f'emulated pipeline gained parameters: {sorted(emu_names - set(center))}'
+    """Center-exact match (atol=1e-8) and shifted accuracy (relative < tol).
+
+    The deployed emulator exposes a per-emulator coverage-check parameter
+    (``emulator_<class>_<hash>.box``) that tracks how far the evaluation point
+    lies outside the training box. It is internal bookkeeping, not part of the
+    theory, so it is filtered from the parameter-interface comparison; when the
+    call omits it, the deployed calculator uses its fixed default value.
+    """
+    center = {p.name: p.value for p in pipe_exact.params
+              if not p.name.startswith('emulator_')}
+    emu_names = {n for n in pipe_emu.params.names()
+                 if not n.startswith('emulator_')}
+    assert emu_names <= set(center), \
+        f'emulated pipeline gained parameters: {sorted(emu_names - set(center))}'
     emu_center = {name: value for name, value in center.items() if name in emu_names}
     exact_center_value = np.asarray(pipe_exact(center))
     emu_center_value = np.asarray(pipe_emu(emu_center))
@@ -122,7 +129,6 @@ def _check(pipe_exact, pipe_emu, shift_param, reldiff_tol=0.10):
         reldiff = float(np.max(np.abs(emu_s - exact_s) / (np.abs(exact_s) + 1e-30)))
         assert reldiff < reldiff_tol, \
             f'shifted [{shift_param}+5%]: max reldiff={reldiff:.3f} > {reldiff_tol:.2f}'
-
 
 # ── Kaiser ─────────────────────────────────────────────────────────────────────
 
@@ -389,6 +395,17 @@ def test_folps_spectrum3_poles_prior_bases():
         assert out.shape == (len(_ELLS3), len(_K3)), f'unexpected shape {out.shape} for prior_basis={prior_basis!r}'
 
 
+
+def _pk1(pipe, point):
+    """Evaluate *pipe* at *point* and return ``pk_1loop`` as an array.
+
+    The raw pt returns the array from ``__call__``; the emulated subclass
+    sets it as an attribute and returns ``self`` (so the tracer can read
+    ``.pk_1loop``, ``.f``, … after the call). Both end up as the same array.
+    """
+    out = pipe(**point)
+    return np.asarray(getattr(out, 'pk_1loop', out))
+
 def test_folps_spectrum3_poles_emulated():
     """FOLPSPTSpectrum2Poles emulated as pt= in FOLPSTracerSpectrum3Poles."""
     pytest.importorskip('folps')
@@ -400,6 +417,133 @@ def test_folps_spectrum3_poles_emulated():
     pipe_emu = _emulate(theory_emu)
 
     _check(pipe_exact, pipe_emu, shift_param='b1p')
+
+
+def test_geofptax_spectrum3_poles_emulated():
+    """GeoFPTAXPTSpectrum2Poles emulated as pt= in GeoFPTAXTracerSpectrum3Poles."""
+    pytest.importorskip('geofptax')
+    from desilike.theories.galaxy_clustering.full_shape import (
+        GeoFPTAXPTSpectrum2Poles, GeoFPTAXTracerSpectrum3Poles)
+
+    _K3 = np.column_stack([np.linspace(0.02, 0.1, 5)] * 2)
+    _ELLS3 = ((0, 0, 0), (2, 0, 2))
+
+    pipe_exact = build(GeoFPTAXTracerSpectrum3Poles(k=_K3, ells=_ELLS3))
+    theory_emu = GeoFPTAXTracerSpectrum3Poles(
+        k=_K3, ells=_ELLS3, pt=GeoFPTAXPTSpectrum2Poles())
+    pipe_emu = _emulate(theory_emu)
+    _check(pipe_exact, pipe_emu, shift_param='b1')
+
+def test_geofptax_routing_select_params():
+    """GeoFPTAXEmulator routes (w0_fld, wa_fld, logA) out of the grid."""
+    pytest.importorskip('geofptax')
+    from desilike.theories.galaxy_clustering.full_shape import (
+        GeoFPTAXPTSpectrum2Poles, GeoFPTAXEmulator)
+
+    pt = GeoFPTAXPTSpectrum2Poles()
+    assert pt.get_emulator_cls() is GeoFPTAXEmulator
+
+    from desilike.emulators import Space
+    bounds = {
+        'h': (0.6, 0.8), 'omega_b': (0.021, 0.024),
+        'omega_cdm': (0.10, 0.14), 'n_s': (0.90, 1.00),
+        'w0_fld': (-1.2, -0.8), 'wa_fld': (-0.6, 0.6),
+        'logA': (2.8, 3.2),
+    }
+    space = Space(bounds=bounds)
+    emu = GeoFPTAXEmulator(pt, space)
+
+    all_names = list(bounds.keys())
+    selected = emu.select_params(all_names)
+    for p in ('w0_fld', 'wa_fld', 'logA'):
+        assert p not in selected, f'{p} should be routed, not gridded'
+    for p in ('h', 'omega_b', 'omega_cdm', 'n_s'):
+        assert p in selected, f'{p} should be gridded, not routed'
+    assert emu.precondition == ('h',), \
+        f'h should be preconditioned, got {emu.precondition}'
+    assert set(all_names) - set(selected) == {'w0_fld', 'wa_fld', 'logA'}
+
+
+
+def test_geofptax_accuracy_in_routed_parameter():
+    """Routing must be exact in (w0_fld, wa_fld, logA) — and we want to know which one costs what."""
+    pytest.importorskip('geofptax')
+    from desilike.theories.galaxy_clustering.full_shape import (
+        GeoFPTAXPTSpectrum2Poles, GeoFPTAXEmulator)
+
+    from desilike.emulators import Space
+    bounds = {
+        'h': (0.6, 0.8), 'omega_b': (0.021, 0.024),
+        'omega_cdm': (0.10, 0.14), 'n_s': (0.90, 1.00),
+        'w0_fld': (-1.4, -0.6), 'wa_fld': (-0.8, 0.8),
+        'logA': (2.7, 3.3),
+    }
+    space = Space(bounds=bounds)
+
+    pipe_exact = build(GeoFPTAXPTSpectrum2Poles())
+
+    emu = GeoFPTAXEmulator(GeoFPTAXPTSpectrum2Poles(), space)
+    emu.train(budget=1)
+    pt_emu_calc = emu.to_calculator(GeoFPTAXPTSpectrum2Poles())
+    pipe_emu = build(pt_emu_calc)
+
+    def _pk1(pipe, point):
+        out = pipe(**point)
+        return np.asarray(getattr(out, 'pk_1loop', out))
+
+    def _residual(point):
+        e = _pk1(pipe_exact, point)
+        m = _pk1(pipe_emu, point)
+        # ignore the k-range where pk crosses zero, where a relative metric is meaningless
+        mask = np.abs(e) > 0.1 * np.abs(e).max()
+        return float(np.max(np.abs(m - e)[mask] / np.abs(e)[mask]))
+
+    center = {name: 0.5 * (lo + hi) for name, (lo, hi) in bounds.items()}
+
+    print(f'\nCenter (should be ~1e-15): {_residual(center):.2e}')
+    for name, delta in (('logA', 0.25), ('w0_fld', -0.35), ('wa_fld', 0.7)):
+        point = dict(center, **{name: center[name] + delta})
+        print(f'{name} = center + {delta:+.2f} ({point[name]:.3f}): '
+              f'reldiff = {_residual(point):.2e}')
+
+    full = dict(center, w0_fld=-1.35, wa_fld=0.7, logA=3.25)
+    print(f'All three at the failing point: {_residual(full):.2e}')
+
+    
+def test_geofptax_accuracy_in_grid_parameter():
+    """The emulator must reproduce the exact PT at shifted `h` and `omega_cdm`."""
+    pytest.importorskip('geofptax')
+    from desilike.theories.galaxy_clustering.full_shape import (
+        GeoFPTAXPTSpectrum2Poles, GeoFPTAXEmulator)
+
+    from desilike.emulators import Space
+    bounds = {
+        'h': (0.55, 0.85), 'omega_b': (0.020, 0.025),
+        'omega_cdm': (0.08, 0.16), 'n_s': (0.85, 1.05),
+        'w0_fld': (-1.4, -0.6), 'wa_fld': (-0.8, 0.8),
+        'logA': (2.7, 3.3),
+    }
+    space = Space(bounds=bounds)
+
+    pipe_exact = build(GeoFPTAXPTSpectrum2Poles())
+
+    emu = GeoFPTAXEmulator(GeoFPTAXPTSpectrum2Poles(), space)
+    emu.train(budget=2)
+    pt_emu_calc = emu.to_calculator(GeoFPTAXPTSpectrum2Poles())
+    pipe_emu = build(pt_emu_calc)
+
+    def _pk1(pipe, point):
+        out = pipe(**point)
+        return np.asarray(getattr(out, 'pk_1loop', out))
+
+    center = {name: 0.5 * (lo + hi) for name, (lo, hi) in bounds.items()}
+    for shift in (dict(h=0.72), dict(omega_cdm=0.11), dict(n_s=0.98)):
+        point = dict(center, **shift)
+        exact = _pk1(pipe_exact, point)
+        emulated = _pk1(pipe_emu, point)
+        reldiff = float(np.max(np.abs(emulated - exact) / (np.abs(exact) + 1e-30)))
+        assert reldiff < 0.05, \
+            f'grid-parameter shift {shift}: max reldiff={reldiff:.3f} > 0.05'
 
 
 if __name__ == '__main__':
