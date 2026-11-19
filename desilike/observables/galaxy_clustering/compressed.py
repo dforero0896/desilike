@@ -96,6 +96,17 @@ def _format_compression_data(data, covariance, parameters):
     return obs, flatdata, parameters, cov
 
 
+def _shapefit_tilt_parameters(parameters):
+    """Return the ShapeFit tilt parameters in *parameters*: ``'dn'`` or the absolute ``'n'``.
+
+    In the default ``n_varied=False`` mode ``dm`` is the log-slope of the full no-wiggle
+    spectrum, so it already contains the shift of ``n_s``; a data row for ``dn`` (or the
+    absolute ``n``) would then count the primordial tilt twice.  Only ``n_varied=True``,
+    where ``dm`` is the shape-only slope and ``dn = n_s - n_s,fid``, makes it independent.
+    """
+    return [name for name in parameters if name in ('dn', 'n')]
+
+
 class BaseCompressionObservable(Calculator):
     """Base class for compressed observables.
 
@@ -247,6 +258,9 @@ class ShapeFitCompressionObservable(BaseCompressionObservable):
         Covariance matrix.
     parameters : list of str, default=None
         Parameter names; required when *data* is not an lsstypes object.
+        If ``'dn'`` (or the absolute ``'n'``) is among them, ``n_varied=True`` is enabled
+        automatically on a live theory (the pre-refactor behaviour).  An emulator deployed
+        with ``n_varied=False`` cannot be switched after training and raises.
     name : str, default='shapefit'
         Observable name.
     theory : ShapeFitTheory, optional
@@ -260,7 +274,10 @@ class ShapeFitCompressionObservable(BaseCompressionObservable):
     kp : float, default=0.03
         Pivot wavenumber [h/Mpc] of the ShapeFit parameterization.
     n_varied : bool, default=False
-        Use the second-order ShapeFit parameter ``n``.
+        Use the second-order ShapeFit parameter ``n``.  Usually need not be passed: it is
+        enabled automatically when ``'dn'`` or ``'n'`` is in *parameters*, since with
+        ``n_varied=False`` the ``dm`` already contains the n_s shift and the tilt would be
+        counted twice.  With ``n_varied=True``, leave n_s free in the reinterpretation.
     with_now : str, default='peakaverage'
         Engine for the no-wiggle power spectrum.
     fiducial : str or cosmoprimo.Cosmology, default='DESI'
@@ -276,6 +293,46 @@ class ShapeFitCompressionObservable(BaseCompressionObservable):
             theory.update(**kwargs)
         super().__init__(theory=theory,
                          data=data, covariance=covariance, parameters=parameters, name=name)
+        # The theory's stored mode is authoritative: a regular theory has already applied the
+        # n_varied keyword through update(), and an emulator-deployed theory has a no-op update()
+        # but carries the mode in its pytree aux.  Fall back to the keyword only for wrappers
+        # that do not expose the mode at all.
+        n_varied = getattr(theory, 'n_varied', None)
+        if n_varied is None:
+            n_varied = getattr(theory, '_n_varied', None)
+        if n_varied is None:
+            n_varied = kwargs.get('n_varied', None)
+        self._n_varied = None if n_varied is None else bool(n_varied)
+        # Restore the automatic coupling that main's ShapeFitPowerSpectrumTemplate had
+        # (``self.n_varied = self.init.params['dn'].varied``) and the old compression
+        # observable had (``n_varied='n' in ...``): a chain carrying the tilt is only
+        # consistent with the shape-only definition of ``m``.  A live theory can be
+        # reconfigured here; an emulator's update() is a no-op, so it must have been trained
+        # with n_varied=True and cannot be switched afterwards.
+        tilt_parameters = _shapefit_tilt_parameters(self.parameters)
+        if tilt_parameters and not self._n_varied:
+            try:
+                theory.update(n_varied=True)
+            except Exception as exc:
+                raise ValueError(
+                    f"Compressed parameters {tilt_parameters} include a ShapeFit tilt parameter, but "
+                    f"{type(theory).__name__} could not be reconfigured with n_varied=True."
+                ) from exc
+            n_varied = getattr(theory, 'n_varied', None)
+            if n_varied is None:
+                n_varied = getattr(theory, '_n_varied', False)
+            self._n_varied = bool(n_varied)
+            if not self._n_varied:
+                raise ValueError(
+                    f"Compressed parameters {tilt_parameters} include a ShapeFit tilt parameter, but "
+                    "the theory is in n_varied=False mode and cannot be reconfigured (an emulator "
+                    "deployed with to_calculator() has a no-op update()).  Retrain/redeploy the "
+                    "emulator with n_varied=True."
+                )
+            self.logger.info(
+                "Compressed parameters %s imply n_varied=True; reconfigured %s accordingly.",
+                tilt_parameters, type(theory).__name__,
+            )
 
 
 class TurnOverCompressionObservable(BaseCompressionObservable):
