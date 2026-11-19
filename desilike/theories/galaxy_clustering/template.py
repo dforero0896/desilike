@@ -1644,6 +1644,10 @@ class ShapeFitTheory(BAOTheory):
         Pivot wavenumber [h/Mpc] of the ShapeFit parameterization.
     n_varied : bool, default=False
         Use the second-order ShapeFit parameter ``n``; this changes the definition of ``m``.
+        Set to True whenever the template's ``dn`` is freed: in that mode ``dm`` is the
+        shape-only slope and ``dn = n_s - n_s,fid`` carries the primordial tilt.  With
+        ``n_varied=False``, ``dm`` already includes the ``n_s`` shift, so a free ``dn``
+        would count it twice.
     with_now : str, default='peakaverage'
         Engine for the no-wiggle power spectrum.
     fiducial : str or cosmoprimo.Cosmology, default='DESI'
@@ -1691,6 +1695,10 @@ class ShapeFitTheory(BAOTheory):
     def __init__(self, z=1., eta=1./3., kp=0.03, n_varied=False, with_now='peakaverage', fiducial='DESI',
                  cosmo=None, gam_estimator='rms_phase_detrend', gam_opts=None):
         super().__init__(z=z, eta=eta, fiducial=fiducial, cosmo=cosmo)
+        # Set here, not only in __post_init__, so the mode is readable before build (the
+        # compression observable validates a free dn against it at construction) and so it
+        # survives tree reconstruction.  __post_init__ repeats the assignment for direct calls.
+        self._n_varied = bool(n_varied)
 
     def __post_init__(self, z=1., eta=1./3., kp=0.03, n_varied=False, with_now='peakaverage', fiducial='DESI',
                       cosmo=None, gam_estimator='rms_phase_detrend', gam_opts=None):
@@ -1755,6 +1763,11 @@ class ShapeFitTheory(BAOTheory):
         self._gam_state = self._gam_est.prepare(np.log(self._k_gam_fine), log_pk_gam_fid,
                                                 log_pknow_gam_fid, self._rd_fid, kp=self._kp,
                                                 **(gam_opts or {}))
+
+    @property
+    def n_varied(self):
+        """Whether ``m`` has the primordial tilt divided out (constructor ``n_varied``)."""
+        return getattr(self, '_n_varied', False)
 
     def _log_slope(self, pknow, pk_prim=None, kp=None):
         """Log-slope of *pknow* (divided by the primordial ``pk * k`` when ``n_varied``) at *kp*."""
@@ -1825,6 +1838,10 @@ class ShapeFitTheory(BAOTheory):
 
     def tree_flatten(self):
         leaves, aux = super().tree_flatten()
+        aux = dict(aux)
+        # The mode changes the definition of ``m``, so an emulated or rebuilt theory must
+        # keep it: the compression observable validates a free ``dn`` against it.
+        aux['n_varied'] = self.n_varied
         return leaves + [self.m, self.n, self.dm, self.dn, self.df, self.f_sqrt_Ap, self.Ap, self.dA,
                          self.dc, self.deps, self.dgam], aux
 
@@ -1836,6 +1853,9 @@ class ShapeFitTheory(BAOTheory):
          obj.m, obj.n, obj.dm, obj.dn, obj.df, obj.f_sqrt_Ap, obj.Ap, obj.dA,
          obj.dc, obj.deps, obj.dgam) = children
         obj.z = aux['z']
+        # Emulators written before this key existed carry no n_varied; they were all trained
+        # in the default mode, so False is the correct fallback.
+        obj._n_varied = bool(aux.get('n_varied', False))
         return obj
 
 
